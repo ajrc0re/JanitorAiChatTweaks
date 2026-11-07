@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         JanitorAiChatTweaks
+// @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
 // @version      1.0.0
 // @description  Improves the JanitorAI Chat Interface
