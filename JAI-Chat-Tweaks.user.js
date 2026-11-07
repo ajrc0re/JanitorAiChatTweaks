@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
-// @version      1.1.0
+// @version      1.2.0
 // @description  Improves the JanitorAI Chat Interface
 // @match        https://janitorai.com/*
 // @run-at       document-start
@@ -39,6 +39,13 @@
 
     // Darken amount for botBubble if darkenBotFromUser = true (0..100)
     botDarkenPct: 20,
+
+    // If true: completely removes the SoundCloud music player under the chat title
+    hideMusicPlayer: false,
+
+    // If true: hides the whole chat header (back button, title, menu) until you
+    // hover the top edge of the screen
+    autoHideHeader: false,
   };
 
   /******************************************************************
@@ -106,8 +113,16 @@
     if (content) setClass(content, "jct-bubble", !editing && content.tagName !== "TEXTAREA");
   }
 
+  // Stop the music player's iframe from loading at all, not just hide it.
+  function killMusicPlayer() {
+    document.querySelectorAll('[class*="soundcloudPlayer"] iframe').forEach((f) => {
+      if (f.getAttribute("src") !== "about:blank") f.setAttribute("src", "about:blank");
+    });
+  }
+
   function tagAll() {
     document.querySelectorAll(BODY_SEL).forEach(tagMessage);
+    if (cfg.hideMusicPlayer) killMusicPlayer();
   }
 
   let scheduled = false;
@@ -222,6 +237,29 @@ img[alt="Character Icon"] { margin-right: 0.5rem !important; }
 }
 
 button[aria-label="continue this message" i] { margin-left: 20px !important; }
+` : ""}
+
+/* ===== Music player ===== */
+${cfg.hideMusicPlayer ? `
+[class*="soundcloudPlayer"] { display: none !important; }
+` : ""}
+
+/* ===== Auto-hide header =====
+   Slide the header up out of view, leaving an invisible strip at the top
+   of the screen. Hovering that strip (or tabbing into the header) brings
+   it back. The short delay stops it vanishing while moving to the menu. */
+${cfg.autoHideHeader ? `
+[data-chat-header="true"] {
+  transform: translateY(calc(-100% + 12px)) !important;
+  opacity: 0 !important;
+  transition: transform 0.2s ease 0.4s, opacity 0.2s ease 0.4s !important;
+}
+[data-chat-header="true"]:hover,
+[data-chat-header="true"]:focus-within {
+  transform: none !important;
+  opacity: 1 !important;
+  transition-delay: 0s !important;
+}
 ` : ""}
 
 /* ===== Small quality-of-life ===== */
