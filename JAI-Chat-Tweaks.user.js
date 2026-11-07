@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
-// @version      1.5.0
+// @version      1.6.0
 // @description  Improves the JanitorAI Chat Interface
 // @match        https://janitorai.com/*
 // @run-at       document-start
@@ -51,6 +51,14 @@
     // usual spot while the rest of the header is hidden.
     alwaysShowProxyIcon: false, // the "using proxy" badge
     alwaysShowMenuIcon: false,  // the ☰ menu button
+
+    // Story notes stripper (the eraser button in the bottom bar). It removes
+    // the tracker line matched by trackerRegex from older bot replies and
+    // saves the edits to JanitorAI, so old trackers stop using up context.
+    // The newest keepTrackerCount bot replies are left untouched.
+    // Default regex: a line starting ~~~ followed by a {...} JSON object.
+    trackerRegex: /\s*^[ \t]*~~~[ \t]*(?:json)?[ \t]*\{.*\}[ \t]*$/gim,
+    keepTrackerCount: 3,
   };
 
   /******************************************************************
@@ -142,6 +150,7 @@
     if (cfg.hideMusicPlayer) killMusicPlayer();
     if (keepHeaderIcons) updateHeaderShift();
     ensureJumpButton();
+    ensureStripButton();
     ensureExportButton();
   }
 
@@ -496,6 +505,7 @@
       if (isFlyoutOpen()) closeFlyout();
       else {
         closeExportFlyout();
+        closeStripFlyout();
         openFlyout(btn);
       }
     });
@@ -672,12 +682,12 @@
       if (isExportOpen()) closeExportFlyout();
       return;
     }
-    const jump = left.querySelector(`#${JUMP_BTN_ID}`);
+    // Keep it directly to the right of the strip button (or the "#" picker).
+    const prev = left.querySelector(`#${STRIP_BTN_ID}`) || left.querySelector(`#${JUMP_BTN_ID}`);
     const existing = left.querySelector(`#${EXPORT_BTN_ID}`);
-    // Keep it directly to the right of the "#" picker.
-    if (existing && (!jump || jump.nextElementSibling === existing)) return;
+    if (existing && (!prev || prev.nextElementSibling === existing)) return;
     const btn = existing || document.getElementById(EXPORT_BTN_ID) || createExportButton();
-    if (jump) jump.after(btn);
+    if (prev) prev.after(btn);
     else left.appendChild(btn);
   }
 
@@ -693,7 +703,193 @@
       e.preventDefault();
       e.stopPropagation();
       if (isExportOpen()) closeExportFlyout();
-      else openExportFlyout(btn);
+      else {
+        closeStripFlyout();
+        openExportFlyout(btn);
+      }
+    });
+    return btn;
+  }
+
+  /******************************************************************
+   * Story notes stripper
+   *
+   * Adds an eraser button between the "#" picker and Export. It opens a
+   * confirm flyout that says how many older bot replies still carry a
+   * tracker line (cfg.trackerRegex). Confirming removes that line from
+   * each of them, keeping the newest cfg.keepTrackerCount bot replies as
+   * they are, and saves every edit through the site's own
+   * messagesStore.editMessage (the same call the edit box's Save uses),
+   * so the change is saved on JanitorAI, not just hidden.
+   ******************************************************************/
+  const STRIP_BTN_ID = "jct-strip-btn";
+  const STRIP_FLYOUT_ID = "jct-strip-flyout";
+  let stripRunning = false;
+
+  function trackerRegex() {
+    const r = cfg.trackerRegex instanceof RegExp ? cfg.trackerRegex : new RegExp(String(cfg.trackerRegex), "gim");
+    // Always a fresh, global copy so every match is removed and lastIndex never leaks.
+    return new RegExp(r.source, r.flags.includes("g") ? r.flags : r.flags + "g");
+  }
+
+  function keepCount() {
+    return Math.max(0, parseInt(cfg.keepTrackerCount, 10) || 0);
+  }
+
+  // Older bot replies that still contain a tracker, with the text each one
+  // should be saved as.
+  function findStripTargets() {
+    const cs = getChatStore();
+    if (!cs) return null;
+    const store = cs.messagesStore;
+    const bots = [];
+    for (let i = 0; i < store.messages.length; i++) {
+      const m = resolveEntry(store, i);
+      if (m && m.is_bot) bots.push(m);
+    }
+    const keep = keepCount();
+    const older = keep > 0 ? bots.slice(0, -keep) : bots;
+    const targets = [];
+    for (const m of older) {
+      if (typeof m.message !== "string") continue;
+      if (typeof store.canEditMessage === "function" && !store.canEditMessage(m)) continue;
+      const text = m.message.replace(trackerRegex(), "").replace(/\s+$/, "");
+      if (text !== m.message.replace(/\s+$/, "") && text.trim()) targets.push({ m, text });
+    }
+    return { store, targets };
+  }
+
+  function setStripStatus(text) {
+    const el = document.querySelector(`#${STRIP_FLYOUT_ID} .jct-strip-status`);
+    if (el) el.textContent = text;
+  }
+
+  function refreshStripFlyout() {
+    const fly = document.getElementById(STRIP_FLYOUT_ID);
+    if (!fly) return;
+    const go = fly.querySelector(".jct-strip-go");
+    const info = fly.querySelector(".jct-strip-info");
+    const found = findStripTargets();
+    const keep = keepCount();
+    const keepText = keep
+      ? ` The newest ${keep} bot repl${keep === 1 ? "y keeps its" : "ies keep their"} notes.`
+      : "";
+    if (!found) {
+      info.textContent = "Chat not loaded yet.";
+      go.disabled = true;
+      return;
+    }
+    const n = found.targets.length;
+    info.textContent = n
+      ? `Remove the story notes from ${n} older bot repl${n === 1 ? "y" : "ies"} and save the edit${n === 1 ? "" : "s"}? This can't be undone.${keepText}`
+      : `No older replies have story notes.${keepText}`;
+    go.disabled = n === 0;
+  }
+
+  async function doStrip() {
+    if (stripRunning) return;
+    const found = findStripTargets();
+    if (!found || !found.targets.length) {
+      refreshStripFlyout();
+      return;
+    }
+    stripRunning = true;
+    const go = document.querySelector(`#${STRIP_FLYOUT_ID} .jct-strip-go`);
+    if (go) go.disabled = true;
+    const { store, targets } = found;
+    let done = 0;
+    let failed = 0;
+    for (const t of targets) {
+      setStripStatus(`Saving ${done + failed + 1} of ${targets.length}…`);
+      // editMessage quietly does nothing while another edit is in flight.
+      for (let w = 0; w < 50 && store.isMessageProcessing; w++) await sleep(100);
+      let ok = false;
+      try { ok = await store.editMessage(t.m, t.text); } catch (e) { ok = false; }
+      if (ok) done++;
+      else failed++;
+    }
+    stripRunning = false;
+    refreshStripFlyout();
+    setStripStatus(failed
+      ? `Cleaned ${done}, ${failed} failed`
+      : `Cleaned ${done} repl${done === 1 ? "y" : "ies"}`);
+  }
+
+  function buildStripFlyout() {
+    const fly = document.createElement("div");
+    fly.id = STRIP_FLYOUT_ID;
+    fly.setAttribute("role", "dialog");
+    fly.setAttribute("aria-label", "Strip story notes");
+    fly.innerHTML = `
+      <div class="jct-strip-info"></div>
+      <div class="jct-export-row">
+        <button type="button" class="jct-strip-go">Strip notes</button>
+        <span class="jct-strip-status"></span>
+      </div>
+    `;
+    fly.querySelector(".jct-strip-go").addEventListener("click", doStrip);
+    return fly;
+  }
+
+  function openStripFlyout(btn) {
+    if (isFlyoutOpen()) closeFlyout();
+    if (isExportOpen()) closeExportFlyout();
+    let fly = document.getElementById(STRIP_FLYOUT_ID);
+    if (!fly) {
+      fly = buildStripFlyout();
+      document.body.appendChild(fly);
+    }
+    if (!stripRunning) {
+      setStripStatus("");
+      refreshStripFlyout();
+    }
+    fly.hidden = false;
+    btn.setAttribute("aria-expanded", "true");
+    positionFlyout(fly, btn);
+  }
+
+  function closeStripFlyout() {
+    const fly = document.getElementById(STRIP_FLYOUT_ID);
+    if (fly) fly.hidden = true;
+    const btn = document.getElementById(STRIP_BTN_ID);
+    if (btn) btn.setAttribute("aria-expanded", "false");
+  }
+
+  function isStripOpen() {
+    const fly = document.getElementById(STRIP_FLYOUT_ID);
+    return !!fly && !fly.hidden;
+  }
+
+  function ensureStripButton() {
+    const left = document.querySelector('[class*="controlsLeft"]');
+    if (!left) {
+      if (isStripOpen()) closeStripFlyout();
+      return;
+    }
+    // Keep it directly to the right of the "#" picker.
+    const jump = left.querySelector(`#${JUMP_BTN_ID}`);
+    const existing = left.querySelector(`#${STRIP_BTN_ID}`);
+    if (existing && (!jump || jump.nextElementSibling === existing)) return;
+    const btn = existing || document.getElementById(STRIP_BTN_ID) || createStripButton();
+    if (jump) jump.after(btn);
+    else left.appendChild(btn);
+  }
+
+  function createStripButton() {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.id = STRIP_BTN_ID;
+    btn.title = "Strip story notes from older replies";
+    btn.setAttribute("aria-label", "Strip story notes from older replies");
+    btn.setAttribute("aria-haspopup", "dialog");
+    btn.setAttribute("aria-expanded", "false");
+    // Eraser icon.
+    btn.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 21h10"/><path d="M5.5 13.5 13 6a2 2 0 0 1 2.8 0l3.2 3.2a2 2 0 0 1 0 2.8l-7.5 7.5a2 2 0 0 1-1.4.5H8.3a2 2 0 0 1-1.4-.6L5.5 18a2 2 0 0 1 0-2.8z"/><path d="m9 10 5 5"/></svg>`;
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isStripOpen()) closeStripFlyout();
+      else openStripFlyout(btn);
     });
     return btn;
   }
@@ -702,16 +898,20 @@
     if (e.key !== "Escape") return;
     if (isFlyoutOpen()) closeFlyout();
     if (isExportOpen()) closeExportFlyout();
+    if (isStripOpen()) closeStripFlyout();
   });
   document.addEventListener("mousedown", (e) => {
     if (isFlyoutOpen() && !e.target.closest(`#${FLYOUT_ID}, #${JUMP_BTN_ID}`)) closeFlyout();
     if (isExportOpen() && !e.target.closest(`#${EXPORT_FLYOUT_ID}, #${EXPORT_BTN_ID}`)) closeExportFlyout();
+    if (isStripOpen() && !e.target.closest(`#${STRIP_FLYOUT_ID}, #${STRIP_BTN_ID}`)) closeStripFlyout();
   }, true);
   window.addEventListener("resize", () => {
     const btn = document.getElementById(JUMP_BTN_ID);
     if (isFlyoutOpen() && btn) positionFlyout(document.getElementById(FLYOUT_ID), btn);
     const ebtn = document.getElementById(EXPORT_BTN_ID);
     if (isExportOpen() && ebtn) positionFlyout(document.getElementById(EXPORT_FLYOUT_ID), ebtn);
+    const sbtn = document.getElementById(STRIP_BTN_ID);
+    if (isStripOpen() && sbtn) positionFlyout(document.getElementById(STRIP_FLYOUT_ID), sbtn);
   });
 
   if (keepHeaderIcons) window.addEventListener("resize", scheduleTag);
@@ -862,6 +1062,7 @@ ${keepIconSel ? `
 
 /* ===== Message jump & copy picker ===== */
 #jct-jump-btn,
+#jct-strip-btn,
 #jct-export-btn {
   height: 32px;
   min-width: 32px;
@@ -874,9 +1075,18 @@ ${keepIconSel ? `
   cursor: pointer;
   flex: none;
 }
+#jct-strip-btn,
 #jct-export-btn { margin-left: 6px; }
+#jct-strip-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
 #jct-jump-btn:hover,
 #jct-jump-btn[aria-expanded="true"],
+#jct-strip-btn:hover,
+#jct-strip-btn[aria-expanded="true"],
 #jct-export-btn:hover,
 #jct-export-btn[aria-expanded="true"] {
   background: rgba(255, 255, 255, 0.08);
@@ -979,7 +1189,8 @@ ${keepIconSel ? `
 .jct-flash { animation: jct-flash 1.6s ease-out; border-radius: 10px; }
 
 /* ===== Chat export ===== */
-#jct-export-flyout {
+#jct-export-flyout,
+#jct-strip-flyout {
   position: fixed;
   z-index: 1000;
   display: flex;
@@ -995,8 +1206,11 @@ ${keepIconSel ? `
   color: rgba(255, 255, 255, 0.85);
   font: 13px/1.3 -apple-system, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
 }
-#jct-export-flyout[hidden] { display: none; }
-#jct-export-flyout .jct-export-row {
+#jct-export-flyout[hidden],
+#jct-strip-flyout[hidden] { display: none; }
+#jct-strip-flyout { width: min(300px, calc(100vw - 16px)); }
+#jct-export-flyout .jct-export-row,
+#jct-strip-flyout .jct-export-row {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -1010,7 +1224,8 @@ ${keepIconSel ? `
   accent-color: rgb(120, 170, 255);
   flex: none;
 }
-#jct-export-flyout .jct-export-go {
+#jct-export-flyout .jct-export-go,
+#jct-strip-flyout .jct-strip-go {
   height: 28px;
   padding: 0 12px;
   border: 1px solid rgb(120, 170, 255);
@@ -1021,8 +1236,11 @@ ${keepIconSel ? `
   cursor: pointer;
   flex: none;
 }
-#jct-export-flyout .jct-export-go:hover { filter: brightness(1.1); }
-#jct-export-flyout .jct-export-status {
+#jct-export-flyout .jct-export-go:hover,
+#jct-strip-flyout .jct-strip-go:hover { filter: brightness(1.1); }
+#jct-strip-flyout .jct-strip-go[disabled] { opacity: 0.4; cursor: default; filter: none; }
+#jct-export-flyout .jct-export-status,
+#jct-strip-flyout .jct-strip-status {
   flex: 1;
   min-width: 0;
   overflow: hidden;
