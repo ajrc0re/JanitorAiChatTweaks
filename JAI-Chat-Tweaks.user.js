@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
-// @version      1.4.0
+// @version      1.5.0
 // @description  Improves the JanitorAI Chat Interface
 // @match        https://janitorai.com/*
 // @run-at       document-start
@@ -142,6 +142,7 @@
     if (cfg.hideMusicPlayer) killMusicPlayer();
     if (keepHeaderIcons) updateHeaderShift();
     ensureJumpButton();
+    ensureExportButton();
   }
 
   let scheduled = false;
@@ -195,18 +196,26 @@
 
   // Walk up the React fiber tree from the message list to the component
   // that receives the chat store, and return its messagesStore.
-  function getMessagesStore() {
+  function getChatStore() {
+    // Start from a rendered message's list, or from the scroller itself if
+    // no message rows are rendered (the store sits a few levels above both).
     const item = document.querySelector("[data-index]");
-    const start = item && item.parentElement;
-    if (!start) return null;
-    const key = Object.keys(start).find((k) => k.startsWith("__reactFiber"));
-    let f = key && start[key];
-    for (let depth = 0; f && depth < 40; depth++, f = f.return) {
-      const cs = f.memoizedProps && f.memoizedProps.chatStore;
-      const ms = cs && cs.messagesStore;
-      if (ms && Array.isArray(ms.messages)) return ms;
+    const starts = [item && item.parentElement, getScroller()].filter(Boolean);
+    for (const start of starts) {
+      const key = Object.keys(start).find((k) => k.startsWith("__reactFiber"));
+      let f = key && start[key];
+      for (let depth = 0; f && depth < 40; depth++, f = f.return) {
+        const cs = f.memoizedProps && f.memoizedProps.chatStore;
+        const ms = cs && cs.messagesStore;
+        if (ms && Array.isArray(ms.messages)) return cs;
+      }
     }
     return null;
+  }
+
+  function getMessagesStore() {
+    const cs = getChatStore();
+    return cs ? cs.messagesStore : null;
   }
 
   // Each entry is a message, or an array of alternatives (swipes on the
@@ -485,22 +494,220 @@
       e.preventDefault();
       e.stopPropagation();
       if (isFlyoutOpen()) closeFlyout();
-      else openFlyout(btn);
+      else {
+        closeExportFlyout();
+        openFlyout(btn);
+      }
     });
     left.appendChild(btn);
   }
 
+  /******************************************************************
+   * Chat export to Markdown
+   *
+   * Adds an "Export" button to the right of the "#" picker. It opens a
+   * small flyout with an "Include my persona" checkbox (remembered between
+   * visits) and a Download button that saves the whole chat as a .md file.
+   * Messages are written with their raw text, so *actions* stay italic in
+   * Markdown. Like the picker, this reads the site's chat store, so every
+   * message is included even when the list hasn't rendered it.
+   ******************************************************************/
+  const EXPORT_BTN_ID = "jct-export-btn";
+  const EXPORT_FLYOUT_ID = "jct-export-flyout";
+  const PERSONA_PREF_KEY = "jct-export-include-persona";
+
+  function readPref(key, fallback) {
+    try {
+      const v = localStorage.getItem(key);
+      return v === null ? fallback : v === "1";
+    } catch (e) {
+      return fallback;
+    }
+  }
+  function writePref(key, on) {
+    try { localStorage.setItem(key, on ? "1" : "0"); } catch (e) { /* ignore */ }
+  }
+
+  // The persona this chat uses: the active one, else the one the chat names.
+  function chatPersona(cs) {
+    const info = cs.chatInfo || {};
+    const wanted = info.chat && info.chat.persona_id;
+    const list = Array.isArray(info.personas) ? info.personas : [];
+    const active = cs.activePersona;
+    if (active && active.name && (!wanted || active.id === wanted)) return active;
+    return list.find((p) => p && p.id === wanted) || active || list.find((p) => p && p.is_default) || null;
+  }
+
+  function buildMarkdown(includePersona) {
+    const cs = getChatStore();
+    if (!cs) return null;
+    const store = cs.messagesStore;
+    const info = cs.chatInfo || {};
+    const character = info.character || {};
+    const persona = chatPersona(cs);
+
+    const charName = (character.chat_name || character.name || "Character").trim();
+    const userName = ((persona && persona.name) || "You").trim();
+    const title = (character.name || charName).trim();
+    // Greetings and some replies still hold the {{user}} / {{char}} macros.
+    const fill = (t) => String(t)
+      .replace(/\{\{\s*user\s*\}\}/gi, userName)
+      .replace(/\{\{\s*char\s*\}\}/gi, charName);
+
+    const out = [`# ${title}`, ""];
+    const count = store.messages.length;
+    out.push(`_Exported from [JanitorAI](${location.href}) on ${new Date().toLocaleString()} · ${count} message${count === 1 ? "" : "s"}_`, "");
+
+    if (includePersona && persona) {
+      out.push(`## Persona: ${userName}`, "");
+      const about = persona.appearance ? fill(persona.appearance).trim() : "";
+      out.push(about || "_No persona description._", "");
+    }
+
+    out.push("---", "");
+    for (let i = 0; i < count; i++) {
+      const m = resolveEntry(store, i);
+      if (!m) continue;
+      out.push(`### #${i + 1} · ${m.is_bot ? charName : userName}`, "");
+      out.push(fill(typeof m.message === "string" ? m.message : "").trim(), "");
+    }
+    return { text: out.join("\n").replace(/\n{3,}/g, "\n\n"), title, count };
+  }
+
+  function safeFileName(name) {
+    const base = name.replace(/[\\/:*?"<>|\u0000-\u001f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${base || "chat"} ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}.md`;
+  }
+
+  function downloadText(text, filename) {
+    // Must run synchronously inside the click handler for Safari.
+    const blob = new Blob([text], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.rel = "noopener";
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+  }
+
+  function setExportStatus(text) {
+    const el = document.querySelector(`#${EXPORT_FLYOUT_ID} .jct-export-status`);
+    if (el) el.textContent = text;
+  }
+
+  function doExport() {
+    const fly = document.getElementById(EXPORT_FLYOUT_ID);
+    const include = !!(fly && fly.querySelector(".jct-export-persona").checked);
+    const md = buildMarkdown(include);
+    if (!md) {
+      setExportStatus("Couldn't read this chat");
+      return;
+    }
+    downloadText(md.text, safeFileName(md.title));
+    setExportStatus(`Saved ${md.count} message${md.count === 1 ? "" : "s"}`);
+  }
+
+  function buildExportFlyout() {
+    const fly = document.createElement("div");
+    fly.id = EXPORT_FLYOUT_ID;
+    fly.setAttribute("role", "dialog");
+    fly.setAttribute("aria-label", "Export chat");
+    fly.innerHTML = `
+      <label class="jct-export-row">
+        <input type="checkbox" class="jct-export-persona">
+        <span>Include my persona at the top</span>
+      </label>
+      <div class="jct-export-row">
+        <button type="button" class="jct-export-go">Download .md</button>
+        <span class="jct-export-status"></span>
+      </div>
+    `;
+    const box = fly.querySelector(".jct-export-persona");
+    box.checked = readPref(PERSONA_PREF_KEY, false);
+    box.addEventListener("change", () => writePref(PERSONA_PREF_KEY, box.checked));
+    fly.querySelector(".jct-export-go").addEventListener("click", doExport);
+    return fly;
+  }
+
+  function openExportFlyout(btn) {
+    if (isFlyoutOpen()) closeFlyout();
+    let fly = document.getElementById(EXPORT_FLYOUT_ID);
+    if (!fly) {
+      fly = buildExportFlyout();
+      document.body.appendChild(fly);
+    }
+    const cs = getChatStore();
+    const n = cs ? cs.messagesStore.messages.length : 0;
+    setExportStatus(cs ? `${n} message${n === 1 ? "" : "s"}` : "Chat not loaded yet");
+    fly.hidden = false;
+    btn.setAttribute("aria-expanded", "true");
+    positionFlyout(fly, btn);
+  }
+
+  function closeExportFlyout() {
+    const fly = document.getElementById(EXPORT_FLYOUT_ID);
+    if (fly) fly.hidden = true;
+    const btn = document.getElementById(EXPORT_BTN_ID);
+    if (btn) btn.setAttribute("aria-expanded", "false");
+  }
+
+  function isExportOpen() {
+    const fly = document.getElementById(EXPORT_FLYOUT_ID);
+    return !!fly && !fly.hidden;
+  }
+
+  function ensureExportButton() {
+    const left = document.querySelector('[class*="controlsLeft"]');
+    if (!left) {
+      if (isExportOpen()) closeExportFlyout();
+      return;
+    }
+    const jump = left.querySelector(`#${JUMP_BTN_ID}`);
+    const existing = left.querySelector(`#${EXPORT_BTN_ID}`);
+    // Keep it directly to the right of the "#" picker.
+    if (existing && (!jump || jump.nextElementSibling === existing)) return;
+    const btn = existing || document.getElementById(EXPORT_BTN_ID) || createExportButton();
+    if (jump) jump.after(btn);
+    else left.appendChild(btn);
+  }
+
+  function createExportButton() {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.id = EXPORT_BTN_ID;
+    btn.textContent = "Export";
+    btn.title = "Export this chat as a Markdown file";
+    btn.setAttribute("aria-haspopup", "dialog");
+    btn.setAttribute("aria-expanded", "false");
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (isExportOpen()) closeExportFlyout();
+      else openExportFlyout(btn);
+    });
+    return btn;
+  }
+
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && isFlyoutOpen()) closeFlyout();
+    if (e.key !== "Escape") return;
+    if (isFlyoutOpen()) closeFlyout();
+    if (isExportOpen()) closeExportFlyout();
   });
   document.addEventListener("mousedown", (e) => {
-    if (!isFlyoutOpen()) return;
-    if (e.target.closest(`#${FLYOUT_ID}, #${JUMP_BTN_ID}`)) return;
-    closeFlyout();
+    if (isFlyoutOpen() && !e.target.closest(`#${FLYOUT_ID}, #${JUMP_BTN_ID}`)) closeFlyout();
+    if (isExportOpen() && !e.target.closest(`#${EXPORT_FLYOUT_ID}, #${EXPORT_BTN_ID}`)) closeExportFlyout();
   }, true);
   window.addEventListener("resize", () => {
     const btn = document.getElementById(JUMP_BTN_ID);
     if (isFlyoutOpen() && btn) positionFlyout(document.getElementById(FLYOUT_ID), btn);
+    const ebtn = document.getElementById(EXPORT_BTN_ID);
+    if (isExportOpen() && ebtn) positionFlyout(document.getElementById(EXPORT_FLYOUT_ID), ebtn);
   });
 
   if (keepHeaderIcons) window.addEventListener("resize", scheduleTag);
@@ -650,7 +857,8 @@ ${keepIconSel ? `
 ` : ""}
 
 /* ===== Message jump & copy picker ===== */
-#jct-jump-btn {
+#jct-jump-btn,
+#jct-export-btn {
   height: 32px;
   min-width: 32px;
   padding: 0 10px;
@@ -662,8 +870,11 @@ ${keepIconSel ? `
   cursor: pointer;
   flex: none;
 }
+#jct-export-btn { margin-left: 6px; }
 #jct-jump-btn:hover,
-#jct-jump-btn[aria-expanded="true"] {
+#jct-jump-btn[aria-expanded="true"],
+#jct-export-btn:hover,
+#jct-export-btn[aria-expanded="true"] {
   background: rgba(255, 255, 255, 0.08);
   color: #fff;
 }
@@ -762,6 +973,59 @@ ${keepIconSel ? `
   100% { box-shadow: 0 0 0 2px rgba(120, 170, 255, 0); }
 }
 .jct-flash { animation: jct-flash 1.6s ease-out; border-radius: 10px; }
+
+/* ===== Chat export ===== */
+#jct-export-flyout {
+  position: fixed;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: min(260px, calc(100vw - 16px));
+  padding: 10px;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 10px;
+  background: rgb(36, 37, 41);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  color: rgba(255, 255, 255, 0.85);
+  font: 13px/1.3 -apple-system, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+#jct-export-flyout[hidden] { display: none; }
+#jct-export-flyout .jct-export-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: default;
+}
+#jct-export-flyout label.jct-export-row { cursor: pointer; }
+#jct-export-flyout .jct-export-persona {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: rgb(120, 170, 255);
+  flex: none;
+}
+#jct-export-flyout .jct-export-go {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid rgb(120, 170, 255);
+  border-radius: 6px;
+  background: rgb(120, 170, 255);
+  color: #111;
+  font: 600 13px/1 -apple-system, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+  cursor: pointer;
+  flex: none;
+}
+#jct-export-flyout .jct-export-go:hover { filter: brightness(1.1); }
+#jct-export-flyout .jct-export-status {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.6);
+}
 
 /* ===== Small quality-of-life ===== */
 .chat-input-inner { background: none !important; }
