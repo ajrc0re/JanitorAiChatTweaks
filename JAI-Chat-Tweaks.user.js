@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
-// @version      1.2.0
+// @version      1.3.0
 // @description  Improves the JanitorAI Chat Interface
 // @match        https://janitorai.com/*
 // @run-at       document-start
@@ -46,6 +46,11 @@
     // If true: hides the whole chat header (back button, title, menu) until you
     // hover the top edge of the screen
     autoHideHeader: false,
+
+    // Only used when autoHideHeader is true. If true, these stay visible in their
+    // usual spot while the rest of the header is hidden.
+    alwaysShowProxyIcon: false, // the "using proxy" badge
+    alwaysShowMenuIcon: false,  // the ☰ menu button
   };
 
   /******************************************************************
@@ -120,9 +125,22 @@
     });
   }
 
+  // How far the auto-hidden header is slid up, so icons kept visible can be
+  // slid back down by the same amount and stay where they normally sit.
+  const keepHeaderIcons = cfg.autoHideHeader && (cfg.alwaysShowProxyIcon || cfg.alwaysShowMenuIcon);
+  function updateHeaderShift() {
+    const header = document.querySelector('[data-chat-header="true"]');
+    if (!header) return;
+    const shift = Math.max(0, header.offsetHeight - 12) + "px";
+    if (header.style.getPropertyValue("--jct-header-shift") !== shift) {
+      header.style.setProperty("--jct-header-shift", shift);
+    }
+  }
+
   function tagAll() {
     document.querySelectorAll(BODY_SEL).forEach(tagMessage);
     if (cfg.hideMusicPlayer) killMusicPlayer();
+    if (keepHeaderIcons) updateHeaderShift();
   }
 
   let scheduled = false;
@@ -148,6 +166,8 @@
     });
   }
 
+  if (keepHeaderIcons) window.addEventListener("resize", scheduleTag);
+
   if (document.body) startObserver();
   else document.addEventListener("DOMContentLoaded", startObserver, { once: true });
 
@@ -157,6 +177,12 @@
   const bubbleMode = cfg.bubbles; // separated|joined|none
   const alt = cfg.alternating; // off|userRight|botRight|bothRight
   const widthPct = cfg.chatWidthPct;
+
+  // Header icons kept visible while the header is auto-hidden.
+  const keepIconSel = [
+    cfg.alwaysShowProxyIcon && '[class*="apiTag"]',
+    cfg.alwaysShowMenuIcon && '[class*="menuTrigger"]',
+  ].filter(Boolean).join(", ");
 
   // "separated" styles each paragraph block, "joined" styles the whole message.
   const bubbleTarget = bubbleMode === "separated" ? ".jct-bubble > *" : ".jct-bubble";
@@ -247,19 +273,42 @@ ${cfg.hideMusicPlayer ? `
 /* ===== Auto-hide header =====
    Slide the header up out of view, leaving an invisible strip at the top
    of the screen. Hovering that strip (or tabbing into the header) brings
-   it back. The short delay stops it vanishing while moving to the menu. */
+   it back. The short delay stops it vanishing while moving to the menu.
+   The header is hidden with visibility (not opacity) so the proxy badge
+   and menu button can opt back in; the ::after strip keeps it hoverable. */
 ${cfg.autoHideHeader ? `
 [data-chat-header="true"] {
   transform: translateY(calc(-100% + 12px)) !important;
-  opacity: 0 !important;
-  transition: transform 0.2s ease 0.4s, opacity 0.2s ease 0.4s !important;
+  visibility: hidden !important;
+  transition: transform 0.2s ease 0.4s, visibility 0s linear 0.6s !important;
+}
+[data-chat-header="true"]::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 12px;
+  visibility: visible;
 }
 [data-chat-header="true"]:hover,
 [data-chat-header="true"]:focus-within {
   transform: none !important;
-  opacity: 1 !important;
-  transition-delay: 0s !important;
+  visibility: visible !important;
+  transition: transform 0.2s ease, visibility 0s !important;
 }
+${keepIconSel ? `
+[data-chat-header="true"] :is(${keepIconSel}) {
+  visibility: visible !important;
+  transform: translateY(var(--jct-header-shift, 0px)) !important;
+  transition: transform 0.2s ease 0.4s !important;
+}
+[data-chat-header="true"]:hover :is(${keepIconSel}),
+[data-chat-header="true"]:focus-within :is(${keepIconSel}) {
+  transform: none !important;
+  transition: transform 0.2s ease !important;
+}
+` : ""}
 ` : ""}
 
 /* ===== Small quality-of-life ===== */
