@@ -380,10 +380,14 @@
   }
 
   function positionFlyout(fly, btn) {
+    // Line up with the button, but sit above the whole input box so the
+    // flyout never covers what you're typing.
     const r = btn.getBoundingClientRect();
+    const box = btn.closest('[class*="chatInputInner"]') || btn;
+    const top = Math.min(r.top, box.getBoundingClientRect().top);
     const margin = 8;
     fly.style.left = `${Math.max(margin, Math.min(r.left, window.innerWidth - fly.offsetWidth - margin))}px`;
-    fly.style.bottom = `${window.innerHeight - r.top + 6}px`;
+    fly.style.bottom = `${window.innerHeight - top + 6}px`;
   }
 
   function openFlyout(btn) {
