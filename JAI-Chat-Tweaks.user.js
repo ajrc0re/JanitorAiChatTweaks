@@ -550,9 +550,13 @@
     const userName = ((persona && persona.name) || "You").trim();
     const title = (character.name || charName).trim();
     // Greetings and some replies still hold the {{user}} / {{char}} macros.
+    // Single line breaks become Markdown hard breaks (two trailing spaces)
+    // so they don't get merged into one paragraph when the file is viewed.
     const fill = (t) => String(t)
       .replace(/\{\{\s*user\s*\}\}/gi, userName)
-      .replace(/\{\{\s*char\s*\}\}/gi, charName);
+      .replace(/\{\{\s*char\s*\}\}/gi, charName)
+      .replace(/\r\n?/g, "\n")
+      .replace(/[ \t]*\n(?!\n)/g, (m, off, str) => (off > 0 && str[off - 1] === "\n" ? "\n" : "  \n"));
 
     const out = [`# ${title}`, ""];
     const count = store.messages.length;
