@@ -1,11 +1,14 @@
 // ==UserScript==
 // @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
-// @version      1.6.0
+// @version      1.7.0
 // @description  Improves the JanitorAI Chat Interface
 // @match        https://janitorai.com/*
 // @run-at       document-start
 // @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
 // @homepageURL  https://github.com/ajrc0re/JanitorAiChatTweaks
 // @supportURL   https://github.com/ajrc0re/JanitorAiChatTweaks/issues
 // @updateURL    https://raw.githubusercontent.com/ajrc0re/JanitorAiChatTweaks/main/JAI-Chat-Tweaks.user.js
@@ -14,52 +17,92 @@
 
 (() => {
   /******************************************************************
-   * CONFIG
+   * SETTINGS
+   *
+   * Don't edit these here. Open the settings panel instead: the gear
+   * button in the chat's bottom bar, or the Tampermonkey menu ->
+   * "Chat Tweaks settings". Your choices are saved by the userscript
+   * manager (GM_setValue), so updating the script no longer clashes with
+   * your changes. These are only the defaults for anything you haven't set.
    ******************************************************************/
-  const cfg = {
+  const DEFAULTS = {
     // Chat bubbles: "separated" | "joined" | "none"
     bubbles: "joined",
-
-    // Alternating alignment:
-    // "off" | "userRight" | "botRight" | "bothRight"
+    // Alternating alignment: "off" | "userRight" | "botRight" | "bothRight"
     alternating: "userRight",
-
-    // Chat width percent (0 = default site width, otherwise 40..100 typical)
+    // Chat width percent (0 = default site width)
     chatWidthPct: 85,
-
-    // Bubble colors (RGBA strings). Matches your Stylus intent.
-    // If you want a “theme-like” color, just set these manually.
+    // Bubble colors (RGBA strings)
     userBubble: "rgba(24, 24, 24, 0.80)",
-
-    // Bot bubble can optionally be darker
     botBubble: "rgba(26, 27, 22, 0.80)",
-
-    // If true: botBubble is auto-darkened from userBubble instead of using botBubble
+    // If true: botBubble is auto-darkened from userBubble by botDarkenPct (0..100)
     darkenBotFromUser: false,
-
-    // Darken amount for botBubble if darkenBotFromUser = true (0..100)
     botDarkenPct: 20,
-
-    // If true: completely removes the SoundCloud music player under the chat title
+    // Completely remove the SoundCloud music player under the chat title
     hideMusicPlayer: false,
-
-    // If true: hides the whole chat header (back button, title, menu) until you
-    // hover the top edge of the screen
+    // Hide the chat header until you hover the top edge of the screen
     autoHideHeader: false,
-
-    // Only used when autoHideHeader is true. If true, these stay visible in their
-    // usual spot while the rest of the header is hidden.
-    alwaysShowProxyIcon: false, // the "using proxy" badge
-    alwaysShowMenuIcon: false,  // the ☰ menu button
-
-    // Story notes stripper (the eraser button in the bottom bar). It removes
-    // the tracker line matched by trackerRegex from older bot replies and
-    // saves the edits to JanitorAI, so old trackers stop using up context.
-    // The newest keepTrackerCount bot replies are left untouched.
-    // Default regex: a line starting ~~~ followed by a {...} JSON object.
-    trackerRegex: /\s*^[ \t]*~~~[ \t]*(?:json)?[ \t]*\{.*\}[ \t]*$/gim,
+    // With autoHideHeader: keep these visible in their usual spot
+    alwaysShowProxyIcon: false,
+    alwaysShowMenuIcon: false,
+    // Story notes stripper (eraser button): the tracker line to remove
+    // (a regular expression, used with the g, i and m flags) and how many of
+    // the newest bot replies keep theirs.
+    trackerRegex: String.raw`\s*^[ \t]*~~~[ \t]*(?:json)?[ \t]*\{.*\}[ \t]*$`,
     keepTrackerCount: 3,
   };
+
+  const SETTINGS_KEY = "settings";
+
+  // GM storage when the manager provides it, localStorage otherwise.
+  function storageGet() {
+    try {
+      if (typeof GM_getValue === "function") {
+        const v = GM_getValue(SETTINGS_KEY, null);
+        return typeof v === "string" ? JSON.parse(v) : v;
+      }
+    } catch (e) { /* fall through */ }
+    try { return JSON.parse(localStorage.getItem("jct-" + SETTINGS_KEY) || "null"); } catch (e) { return null; }
+  }
+  function storageSet(obj) {
+    const json = JSON.stringify(obj);
+    try {
+      if (typeof GM_setValue === "function") { GM_setValue(SETTINGS_KEY, json); return; }
+    } catch (e) { /* fall through */ }
+    try { localStorage.setItem("jct-" + SETTINGS_KEY, json); } catch (e) { /* ignore */ }
+  }
+
+  // Only keep known keys whose type matches the default.
+  function sanitize(obj) {
+    const out = {};
+    if (!obj || typeof obj !== "object") return out;
+    for (const k of Object.keys(DEFAULTS)) {
+      if (k in obj && typeof obj[k] === typeof DEFAULTS[k]) out[k] = obj[k];
+    }
+    return out;
+  }
+
+  // Saved values only differ from defaults where you changed something, so
+  // a default improved in a later version still reaches you.
+  function loadSettings() {
+    return Object.assign({}, DEFAULTS, sanitize(storageGet()));
+  }
+  // "rgba(1,2,3,0.80)" and "rgba(1, 2, 3, 0.8)" count as the same color.
+  function sameSetting(a, b) {
+    if (a === b) return true;
+    if (typeof a !== "string" || typeof b !== "string") return false;
+    const ca = parseRgba(a), cb = parseRgba(b);
+    return !!ca && !!cb && toRgba(ca) === toRgba(cb);
+  }
+  function saveSettings(next) {
+    const diff = {};
+    for (const k of Object.keys(DEFAULTS)) {
+      if (!sameSetting(next[k], DEFAULTS[k])) diff[k] = next[k];
+    }
+    storageSet(diff);
+  }
+
+  let cfg = loadSettings();
 
   /******************************************************************
    * Small color helper (optional, only used if darkenBotFromUser=true)
@@ -76,12 +119,13 @@
     return { r: c.r * (1 - p), g: c.g * (1 - p), b: c.b * (1 - p), a: c.a };
   }
 
-  const userC = cfg.userBubble;
-  let botC = cfg.botBubble;
-
-  if (cfg.darkenBotFromUser) {
-    const parsed = parseRgba(cfg.userBubble);
-    if (parsed) botC = toRgba(darken(parsed, cfg.botDarkenPct));
+  function bubbleColors() {
+    let bot = cfg.botBubble;
+    if (cfg.darkenBotFromUser) {
+      const parsed = parseRgba(cfg.userBubble);
+      if (parsed) bot = toRgba(darken(parsed, cfg.botDarkenPct));
+    }
+    return { user: cfg.userBubble, bot };
   }
 
   /******************************************************************
@@ -135,7 +179,9 @@
 
   // How far the auto-hidden header is slid up, so icons kept visible can be
   // slid back down by the same amount and stay where they normally sit.
-  const keepHeaderIcons = cfg.autoHideHeader && (cfg.alwaysShowProxyIcon || cfg.alwaysShowMenuIcon);
+  function keepHeaderIcons() {
+    return cfg.autoHideHeader && (cfg.alwaysShowProxyIcon || cfg.alwaysShowMenuIcon);
+  }
   function updateHeaderShift() {
     const header = document.querySelector('[data-chat-header="true"]');
     if (!header) return;
@@ -148,10 +194,11 @@
   function tagAll() {
     document.querySelectorAll(BODY_SEL).forEach(tagMessage);
     if (cfg.hideMusicPlayer) killMusicPlayer();
-    if (keepHeaderIcons) updateHeaderShift();
+    if (keepHeaderIcons()) updateHeaderShift();
     ensureJumpButton();
     ensureStripButton();
     ensureExportButton();
+    ensureSettingsButton();
   }
 
   let scheduled = false;
@@ -727,9 +774,12 @@
   let stripRunning = false;
 
   function trackerRegex() {
-    const r = cfg.trackerRegex instanceof RegExp ? cfg.trackerRegex : new RegExp(String(cfg.trackerRegex), "gim");
-    // Always a fresh, global copy so every match is removed and lastIndex never leaks.
-    return new RegExp(r.source, r.flags.includes("g") ? r.flags : r.flags + "g");
+    // Always a fresh copy so lastIndex never leaks between uses.
+    try {
+      return new RegExp(cfg.trackerRegex, "gim");
+    } catch (e) {
+      return new RegExp(DEFAULTS.trackerRegex, "gim");
+    }
   }
 
   function keepCount() {
@@ -914,7 +964,436 @@
     if (isStripOpen() && sbtn) positionFlyout(document.getElementById(STRIP_FLYOUT_ID), sbtn);
   });
 
-  if (keepHeaderIcons) window.addEventListener("resize", scheduleTag);
+  window.addEventListener("resize", () => { if (keepHeaderIcons()) scheduleTag(); });
+
+  /******************************************************************
+   * Settings panel
+   *
+   * A gear button at the end of the bottom bar (and a "Chat Tweaks
+   * settings" entry in the userscript manager's menu) opens a dialog with
+   * every setting. Saving stores them with GM_setValue and re-applies the
+   * styles straight away, no reload needed.
+   ******************************************************************/
+  const SETTINGS_BTN_ID = "jct-settings-btn";
+  const SETTINGS_OVERLAY_ID = "jct-settings-overlay";
+
+  const FIELDS = [
+    { section: "Chat bubbles" },
+    { key: "bubbles", label: "Bubble style", type: "select", options: [
+      ["joined", "One per message"],
+      ["separated", "One per paragraph"],
+      ["none", "None"],
+    ] },
+    { key: "alternating", label: "Right-aligned messages", type: "select", options: [
+      ["off", "None"],
+      ["userRight", "My messages"],
+      ["botRight", "Bot messages"],
+      ["bothRight", "Both"],
+    ] },
+    { key: "chatWidthPct", label: "Chat width (% of window)", hint: "0 keeps the site's own width.", type: "number", min: 0, max: 100 },
+    { key: "userBubble", label: "My bubble color", type: "color" },
+    { key: "darkenBotFromUser", label: "Make the bot bubble a darker shade of mine", type: "checkbox" },
+    { key: "botBubble", label: "Bot bubble color", type: "color", disabledIf: (v) => v.darkenBotFromUser },
+    { key: "botDarkenPct", label: "How much darker (%)", type: "number", min: 0, max: 100, disabledIf: (v) => !v.darkenBotFromUser },
+    { section: "Header" },
+    { key: "hideMusicPlayer", label: "Remove the music player", hint: "Turning this back off needs a page reload to bring the player back.", type: "checkbox" },
+    { key: "autoHideHeader", label: "Hide the header until I hover the top edge", type: "checkbox" },
+    { key: "alwaysShowProxyIcon", label: "Keep the proxy badge visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
+    { key: "alwaysShowMenuIcon", label: "Keep the ☰ menu button visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
+    { section: "Story notes stripper (eraser button)" },
+    { key: "trackerRegex", label: "Tracker pattern (regular expression)", hint: "Used with the g, i and m flags.", type: "text", mono: true },
+    { key: "keepTrackerCount", label: "Newest bot replies that keep their tracker", type: "number", min: 0, max: 999 },
+  ];
+
+  function hexToRgb(hex) {
+    const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+    return m ? { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) } : null;
+  }
+  function rgbToHex(c) {
+    return "#" + [c.r, c.g, c.b].map((n) => clamp(Math.round(n), 0, 255).toString(16).padStart(2, "0")).join("");
+  }
+
+  function buildField(f, values) {
+    const row = document.createElement("div");
+    row.className = "jct-set-row jct-set-" + f.type;
+    row.dataset.key = f.key;
+    const id = "jct-set-" + f.key;
+    const label = document.createElement("label");
+    label.htmlFor = id;
+    label.className = "jct-set-label";
+    label.textContent = f.label;
+    let control;
+
+    if (f.type === "checkbox") {
+      control = document.createElement("input");
+      control.type = "checkbox";
+      control.id = id;
+      control.checked = !!values[f.key];
+      row.append(control, label);
+    } else if (f.type === "select") {
+      control = document.createElement("select");
+      control.id = id;
+      for (const [v, text] of f.options) {
+        const o = document.createElement("option");
+        o.value = v;
+        o.textContent = text;
+        control.appendChild(o);
+      }
+      control.value = values[f.key];
+      row.append(label, control);
+    } else if (f.type === "color") {
+      const c = parseRgba(values[f.key]) || parseRgba(DEFAULTS[f.key]);
+      const wrap = document.createElement("div");
+      wrap.className = "jct-set-colorwrap";
+      control = document.createElement("input");
+      control.type = "color";
+      control.id = id;
+      control.value = rgbToHex(c);
+      const alpha = document.createElement("input");
+      alpha.type = "range";
+      alpha.min = "0";
+      alpha.max = "100";
+      alpha.value = String(Math.round(c.a * 100));
+      alpha.className = "jct-set-alpha";
+      alpha.title = "Opacity";
+      alpha.setAttribute("aria-label", f.label + " opacity");
+      const out = document.createElement("span");
+      out.className = "jct-set-alpha-out";
+      const sync = () => { out.textContent = alpha.value + "%"; };
+      alpha.addEventListener("input", sync);
+      sync();
+      wrap.append(control, alpha, out);
+      row.append(label, wrap);
+    } else {
+      control = document.createElement("input");
+      control.type = f.type === "number" ? "number" : "text";
+      control.id = id;
+      if (f.type === "number") {
+        control.min = String(f.min);
+        control.max = String(f.max);
+        control.step = "1";
+        control.inputMode = "numeric";
+      }
+      if (f.mono) control.classList.add("jct-set-mono");
+      control.spellcheck = false;
+      control.autocomplete = "off";
+      control.value = String(values[f.key]);
+      row.append(label, control);
+    }
+    if (f.hint) {
+      const hint = document.createElement("div");
+      hint.className = "jct-set-hint";
+      hint.textContent = f.hint;
+      row.appendChild(hint);
+    }
+    return row;
+  }
+
+  // Read the form back into a settings object. Returns { values, error }.
+  function readForm(panel) {
+    const values = Object.assign({}, cfg);
+    for (const f of FIELDS) {
+      if (!f.key) continue;
+      const row = panel.querySelector(`.jct-set-row[data-key="${f.key}"]`);
+      const control = row.querySelector("#jct-set-" + f.key);
+      if (f.type === "checkbox") values[f.key] = control.checked;
+      else if (f.type === "select") values[f.key] = control.value;
+      else if (f.type === "number") {
+        const n = parseInt(control.value, 10);
+        values[f.key] = Number.isFinite(n) ? clamp(n, f.min, f.max) : DEFAULTS[f.key];
+      } else if (f.type === "color") {
+        const rgb = hexToRgb(control.value) || { r: 0, g: 0, b: 0 };
+        const a = clamp((parseInt(row.querySelector(".jct-set-alpha").value, 10) || 0) / 100, 0, 1);
+        values[f.key] = toRgba(Object.assign(rgb, { a: +a.toFixed(2) }));
+      } else values[f.key] = control.value;
+    }
+    if (!values.trackerRegex.trim()) values.trackerRegex = DEFAULTS.trackerRegex;
+    try {
+      new RegExp(values.trackerRegex, "gim");
+    } catch (e) {
+      return { values, error: "Tracker pattern isn't a valid regular expression: " + e.message };
+    }
+    return { values, error: null };
+  }
+
+  function updateDisabled(panel) {
+    const { values } = readForm(panel);
+    for (const f of FIELDS) {
+      if (!f.key || !f.disabledIf) continue;
+      const row = panel.querySelector(`.jct-set-row[data-key="${f.key}"]`);
+      const off = !!f.disabledIf(values);
+      row.classList.toggle("jct-set-disabled", off);
+      row.querySelectorAll("input, select").forEach((el) => { el.disabled = off; });
+    }
+  }
+
+  function fillForm(panel, values) {
+    const body = panel.querySelector(".jct-set-body");
+    body.textContent = "";
+    for (const f of FIELDS) {
+      if (f.section) {
+        const h = document.createElement("h3");
+        h.className = "jct-set-section";
+        h.textContent = f.section;
+        body.appendChild(h);
+      } else {
+        body.appendChild(buildField(f, values));
+      }
+    }
+    panel.querySelector(".jct-set-error").textContent = "";
+    updateDisabled(panel);
+  }
+
+  function buildSettingsOverlay() {
+    const overlay = document.createElement("div");
+    overlay.id = SETTINGS_OVERLAY_ID;
+    overlay.hidden = true;
+    overlay.innerHTML = `
+      <div class="jct-set-panel" role="dialog" aria-modal="true" aria-labelledby="jct-set-title">
+        <div class="jct-set-head">
+          <h2 id="jct-set-title">Chat Tweaks settings</h2>
+          <button type="button" class="jct-set-x" aria-label="Close">×</button>
+        </div>
+        <div class="jct-set-body"></div>
+        <div class="jct-set-error" role="alert"></div>
+        <div class="jct-set-foot">
+          <button type="button" class="jct-set-reset">Reset to defaults</button>
+          <span class="jct-set-spacer"></span>
+          <button type="button" class="jct-set-cancel">Cancel</button>
+          <button type="button" class="jct-set-save">Save</button>
+        </div>
+      </div>`;
+    const panel = overlay.querySelector(".jct-set-panel");
+    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) closeSettings(); });
+    panel.addEventListener("input", () => updateDisabled(panel));
+    panel.addEventListener("change", () => updateDisabled(panel));
+    panel.querySelector(".jct-set-x").addEventListener("click", closeSettings);
+    panel.querySelector(".jct-set-cancel").addEventListener("click", closeSettings);
+    panel.querySelector(".jct-set-reset").addEventListener("click", () => fillForm(panel, DEFAULTS));
+    panel.querySelector(".jct-set-save").addEventListener("click", () => {
+      const { values, error } = readForm(panel);
+      if (error) {
+        panel.querySelector(".jct-set-error").textContent = error;
+        return;
+      }
+      cfg = values;
+      saveSettings(cfg);
+      applyStyles();
+      scheduleTag();
+      closeSettings();
+    });
+    // Keep the site's own shortcuts from firing while typing in the panel.
+    overlay.addEventListener("keydown", (e) => {
+      e.stopPropagation();
+      if (e.key === "Escape") closeSettings();
+    });
+    return overlay;
+  }
+
+  function openSettings() {
+    if (!document.body) return;
+    closeFlyout();
+    closeExportFlyout();
+    closeStripFlyout();
+    let overlay = document.getElementById(SETTINGS_OVERLAY_ID);
+    if (!overlay) {
+      overlay = buildSettingsOverlay();
+      document.body.appendChild(overlay);
+    }
+    fillForm(overlay.querySelector(".jct-set-panel"), cfg);
+    overlay.hidden = false;
+    const first = overlay.querySelector(".jct-set-body select, .jct-set-body input");
+    if (first) first.focus();
+  }
+
+  function closeSettings() {
+    const overlay = document.getElementById(SETTINGS_OVERLAY_ID);
+    if (overlay) overlay.hidden = true;
+  }
+
+  function ensureSettingsButton() {
+    const left = document.querySelector('[class*="controlsLeft"]');
+    if (!left) return;
+    // Keep it at the end of our buttons, right of Export.
+    const prev = left.querySelector(`#${EXPORT_BTN_ID}`);
+    const existing = left.querySelector(`#${SETTINGS_BTN_ID}`);
+    if (existing && (!prev || prev.nextElementSibling === existing)) return;
+    const btn = existing || document.getElementById(SETTINGS_BTN_ID) || createSettingsButton();
+    if (prev) prev.after(btn);
+    else left.appendChild(btn);
+  }
+
+  function createSettingsButton() {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.id = SETTINGS_BTN_ID;
+    btn.title = "Chat Tweaks settings";
+    btn.setAttribute("aria-label", "Chat Tweaks settings");
+    btn.setAttribute("aria-haspopup", "dialog");
+    // Gear icon.
+    btn.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      openSettings();
+    });
+    return btn;
+  }
+
+  if (typeof GM_registerMenuCommand === "function") {
+    try { GM_registerMenuCommand("Chat Tweaks settings", openSettings); } catch (e) { /* ignore */ }
+  }
+
+  const SETTINGS_CSS = `
+/* ===== Settings ===== */
+#jct-settings-btn {
+  height: 32px;
+  width: 32px;
+  margin-left: 6px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.7);
+  cursor: pointer;
+  flex: none;
+}
+#jct-settings-btn:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+#jct-settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 100000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  box-sizing: border-box;
+  background: rgba(0, 0, 0, 0.55);
+  font: 14px/1.35 -apple-system, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+  color: rgba(255, 255, 255, 0.88);
+}
+#jct-settings-overlay[hidden] { display: none; }
+#jct-settings-overlay * { box-sizing: border-box; }
+#jct-settings-overlay .jct-set-panel {
+  display: flex;
+  flex-direction: column;
+  width: min(460px, 100%);
+  max-height: min(88vh, 760px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 12px;
+  background: rgb(36, 37, 41);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  text-align: left;
+  direction: ltr;
+}
+#jct-settings-overlay .jct-set-head {
+  display: flex;
+  align-items: center;
+  padding: 12px 14px 8px 16px;
+}
+#jct-settings-overlay h2 { flex: 1; margin: 0; font-size: 16px; font-weight: 600; color: #fff; }
+#jct-settings-overlay .jct-set-x {
+  width: 30px; height: 30px;
+  border: 0; border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.7);
+  font-size: 22px; line-height: 1;
+  cursor: pointer;
+}
+#jct-settings-overlay .jct-set-x:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+#jct-settings-overlay .jct-set-body {
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 0 16px 8px;
+}
+#jct-settings-overlay .jct-set-section {
+  margin: 14px 0 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.5);
+}
+#jct-settings-overlay .jct-set-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  padding: 6px 0;
+}
+#jct-settings-overlay .jct-set-label { flex: 1 1 180px; min-width: 0; cursor: pointer; }
+#jct-settings-overlay .jct-set-checkbox .jct-set-label { flex: 1; }
+#jct-settings-overlay .jct-set-text .jct-set-label { flex-basis: 100%; }
+#jct-settings-overlay .jct-set-hint {
+  flex-basis: 100%;
+  font-size: 12px;
+  color: rgba(255, 255, 255, 0.5);
+}
+#jct-settings-overlay .jct-set-checkbox .jct-set-hint { padding-left: 28px; }
+#jct-settings-overlay .jct-set-disabled { opacity: 0.4; }
+#jct-settings-overlay input[type="checkbox"] {
+  width: 18px; height: 18px; margin: 0;
+  accent-color: rgb(120, 170, 255);
+  flex: none;
+}
+#jct-settings-overlay select,
+#jct-settings-overlay input[type="number"],
+#jct-settings-overlay input[type="text"] {
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.25);
+  color: #fff;
+  font: inherit;
+  font-size: 16px; /* keeps iOS Safari from zooming in */
+}
+#jct-settings-overlay select { flex: 0 1 220px; min-width: 0; }
+#jct-settings-overlay select option { background: rgb(36, 37, 41); color: #fff; }
+#jct-settings-overlay input[type="number"] { width: 80px; flex: none; }
+#jct-settings-overlay input[type="text"] { width: 100%; }
+#jct-settings-overlay .jct-set-mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
+#jct-settings-overlay .jct-set-colorwrap { display: flex; align-items: center; gap: 8px; flex: none; }
+#jct-settings-overlay input[type="color"] {
+  width: 40px; height: 30px; padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+}
+#jct-settings-overlay .jct-set-alpha { width: 90px; accent-color: rgb(120, 170, 255); }
+#jct-settings-overlay .jct-set-alpha-out { width: 36px; text-align: right; font-size: 12px; color: rgba(255, 255, 255, 0.6); }
+#jct-settings-overlay .jct-set-error { padding: 0 16px; color: rgb(255, 140, 140); font-size: 13px; }
+#jct-settings-overlay .jct-set-error:empty { display: none; }
+#jct-settings-overlay .jct-set-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px 14px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+#jct-settings-overlay .jct-set-spacer { flex: 1; }
+#jct-settings-overlay .jct-set-foot button {
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.8);
+  font: 600 13px/1 -apple-system, system-ui, "Segoe UI", Helvetica, Arial, sans-serif;
+  cursor: pointer;
+}
+#jct-settings-overlay .jct-set-foot button:hover { background: rgba(255, 255, 255, 0.08); color: #fff; }
+#jct-settings-overlay .jct-set-foot .jct-set-save {
+  border-color: rgb(120, 170, 255);
+  background: rgb(120, 170, 255);
+  color: #111;
+}
+#jct-settings-overlay .jct-set-foot .jct-set-save:hover { filter: brightness(1.1); background: rgb(120, 170, 255); color: #111; }
+`;
 
   // Start after everything above is defined (the observer calls ensureJumpButton).
   if (document.body) startObserver();
@@ -923,7 +1402,9 @@
   /******************************************************************
    * CSS generation
    ******************************************************************/
+  function buildCss() {
   const bubbleMode = cfg.bubbles; // separated|joined|none
+  const { user: userC, bot: botC } = bubbleColors();
   const alt = cfg.alternating; // off|userRight|botRight|bothRight
   const widthPct = cfg.chatWidthPct;
 
@@ -1252,6 +1733,25 @@ ${keepIconSel ? `
 /* ===== Small quality-of-life ===== */
 .chat-input-inner { background: none !important; }
 `.trim();
+  return css + "\n" + SETTINGS_CSS;
+  }
 
-  GM_addStyle(css);
+  // One <style> element, rewritten whenever settings are saved.
+  let styleEl = null;
+  function applyStyles() {
+    const css = buildCss();
+    if (styleEl && styleEl.isConnected) {
+      styleEl.textContent = css;
+      return;
+    }
+    const added = typeof GM_addStyle === "function" ? GM_addStyle(css) : null;
+    if (added && added.tagName === "STYLE") {
+      styleEl = added;
+    } else if (!added) {
+      styleEl = document.createElement("style");
+      styleEl.textContent = css;
+      (document.head || document.documentElement).appendChild(styleEl);
+    }
+  }
+  applyStyles();
 })();
