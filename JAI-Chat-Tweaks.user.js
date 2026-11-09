@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
-// @version      1.7.0
+// @version      1.7.1
 // @description  Improves the JanitorAI Chat Interface
 // @match        https://janitorai.com/*
 // @run-at       document-start
@@ -48,7 +48,8 @@
     // Story notes stripper (eraser button): the tracker line to remove
     // (a regular expression, used with the g, i and m flags) and how many of
     // the newest bot replies keep theirs.
-    trackerRegex: String.raw`\s*^[ \t]*~~~[ \t]*(?:json)?[ \t]*\{.*\}[ \t]*$`,
+    // The default also takes a closing ~~~ after the JSON, and ~~~ on its own line.
+    trackerRegex: String.raw`\s*^[ \t]*~~~[ \t]*(?:json)?\s*\{.*\}(?:\s*~~~)?[ \t]*$`,
     keepTrackerCount: 3,
   };
 
@@ -72,12 +73,20 @@
     try { localStorage.setItem("jct-" + SETTINGS_KEY, json); } catch (e) { /* ignore */ }
   }
 
+  // Earlier default values. A saved value equal to one of these is treated
+  // as "not changed", so you get the improved default.
+  const OLD_DEFAULTS = {
+    trackerRegex: [String.raw`\s*^[ \t]*~~~[ \t]*(?:json)?[ \t]*\{.*\}[ \t]*$`],
+  };
+
   // Only keep known keys whose type matches the default.
   function sanitize(obj) {
     const out = {};
     if (!obj || typeof obj !== "object") return out;
     for (const k of Object.keys(DEFAULTS)) {
-      if (k in obj && typeof obj[k] === typeof DEFAULTS[k]) out[k] = obj[k];
+      if (!(k in obj) || typeof obj[k] !== typeof DEFAULTS[k]) continue;
+      if (OLD_DEFAULTS[k] && OLD_DEFAULTS[k].includes(obj[k])) continue;
+      out[k] = obj[k];
     }
     return out;
   }
