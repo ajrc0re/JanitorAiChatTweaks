@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
-// @version      1.7.1
-// @description  Improves the JanitorAI Chat Interface
+// @version      1.8.0
+// @description  Improves the JanitorAI and Saucepan chat interfaces
 // @match        https://janitorai.com/*
+// @match        https://saucepan.ai/*
+// @match        https://www.saucepan.ai/*
 // @run-at       document-start
 // @grant        GM_addStyle
 // @grant        GM_getValue
@@ -53,7 +55,29 @@
     keepTrackerCount: 3,
   };
 
-  const SETTINGS_KEY = "settings";
+  /******************************************************************
+   * Site detection
+   *
+   * The script runs on JanitorAI and Saucepan. Each site gets its own
+   * saved settings and can override defaults here. Everything that reads
+   * the page goes through the site adapter (`site`, defined further down),
+   * so the buttons, flyouts and settings panel are shared.
+   ******************************************************************/
+  const SITE = /(^|\.)saucepan\.ai$/i.test(location.hostname) ? "saucepan" : "janitor";
+
+  const SITE_DEFAULTS = {
+    janitor: {},
+    saucepan: {
+      // Saucepan's story notes are the final line of a reply: one line of
+      // minified JSON in spoiler tags, >!{...}!<, sometimes still wrapped in
+      // <notes> ... </notes>.
+      trackerRegex: String.raw`\s*^[ \t]*(?:<notes>\s*)?>!\s*\{.*\}\s*!<(?:\s*<\/notes>)?[ \t]*$`,
+    },
+  };
+  Object.assign(DEFAULTS, SITE_DEFAULTS[SITE]);
+
+  // JanitorAI keeps the original key so existing settings carry over.
+  const SETTINGS_KEY = SITE === "janitor" ? "settings" : "settings-" + SITE;
 
   // GM storage when the manager provides it, localStorage otherwise.
   function storageGet() {
@@ -189,7 +213,7 @@
   // How far the auto-hidden header is slid up, so icons kept visible can be
   // slid back down by the same amount and stay where they normally sit.
   function keepHeaderIcons() {
-    return cfg.autoHideHeader && (cfg.alwaysShowProxyIcon || cfg.alwaysShowMenuIcon);
+    return site.styling && cfg.autoHideHeader && (cfg.alwaysShowProxyIcon || cfg.alwaysShowMenuIcon);
   }
   function updateHeaderShift() {
     const header = document.querySelector('[data-chat-header="true"]');
@@ -201,9 +225,11 @@
   }
 
   function tagAll() {
-    document.querySelectorAll(BODY_SEL).forEach(tagMessage);
-    if (cfg.hideMusicPlayer) killMusicPlayer();
-    if (keepHeaderIcons()) updateHeaderShift();
+    if (site.styling) {
+      document.querySelectorAll(BODY_SEL).forEach(tagMessage);
+      if (cfg.hideMusicPlayer) killMusicPlayer();
+      if (keepHeaderIcons()) updateHeaderShift();
+    }
     ensureJumpButton();
     ensureStripButton();
     ensureExportButton();
@@ -298,7 +324,7 @@
   }
 
   // Message list as [{ isBot }], from the store or, failing that, the DOM.
-  function listMessages() {
+  function jaiListMessages() {
     const store = getMessagesStore();
     if (store) {
       return store.messages.map((_, i) => {
@@ -323,7 +349,7 @@
   }
 
   // Index of the message at the top of the screen, to highlight in the grid.
-  function currentIndex() {
+  function jaiCurrentIndex() {
     const top = viewTop();
     let best = -1;
     for (const el of document.querySelectorAll("[data-index]")) {
@@ -338,7 +364,7 @@
     return idx.length ? [Math.min(...idx), Math.max(...idx)] : null;
   }
 
-  async function jumpTo(i) {
+  async function jaiJumpTo(i) {
     const sc = getScroller();
     if (!sc) return false;
     const store = getMessagesStore();
@@ -385,7 +411,7 @@
     return true;
   }
 
-  function messageText(i) {
+  function jaiMessageText(i) {
     const store = getMessagesStore();
     if (store) {
       const m = resolveEntry(store, i);
@@ -437,7 +463,7 @@
 
   function pick(i) {
     if (copyMode) {
-      const text = messageText(i);
+      const text = site.messageText(i);
       if (text == null) {
         setStatus(`Couldn't read #${i + 1}`);
         return;
@@ -452,7 +478,7 @@
       return;
     }
     closeFlyout();
-    jumpTo(i);
+    site.jumpTo(i);
   }
 
   function buildFlyout() {
@@ -490,7 +516,7 @@
     // Line up with the button, but sit above the whole input box so the
     // flyout never covers what you're typing.
     const r = btn.getBoundingClientRect();
-    const box = btn.closest('[class*="chatInputInner"]') || btn;
+    const box = site.inputBox(btn) || btn;
     const top = Math.min(r.top, box.getBoundingClientRect().top);
     const margin = 8;
     fly.style.left = `${Math.max(margin, Math.min(r.left, window.innerWidth - fly.offsetWidth - margin))}px`;
@@ -503,8 +529,8 @@
       fly = buildFlyout();
       document.body.appendChild(fly);
     }
-    const msgs = listMessages();
-    const current = currentIndex();
+    const msgs = site.listMessages();
+    const current = site.currentIndex();
     const grid = fly.querySelector(".jct-jump-grid");
     grid.innerHTML = msgs
       .map((m, i) => {
@@ -539,7 +565,7 @@
   // Called from the MutationObserver pass: (re)insert the button whenever
   // React re-renders the bottom bar or you switch chats.
   function ensureJumpButton() {
-    const left = document.querySelector('[class*="controlsLeft"]');
+    const left = site.controls();
     if (!left) {
       if (isFlyoutOpen()) closeFlyout();
       return;
@@ -604,17 +630,32 @@
     return list.find((p) => p && p.id === wanted) || active || list.find((p) => p && p.is_default) || null;
   }
 
-  function buildMarkdown(includePersona) {
+  // JanitorAI: the chat in the shape the export and the stripper use.
+  function jaiChatData() {
     const cs = getChatStore();
     if (!cs) return null;
     const store = cs.messagesStore;
     const info = cs.chatInfo || {};
     const character = info.character || {};
     const persona = chatPersona(cs);
-
     const charName = (character.chat_name || character.name || "Character").trim();
-    const userName = ((persona && persona.name) || "You").trim();
-    const title = (character.name || charName).trim();
+    const messages = store.messages.map((_, i) => {
+      const m = resolveEntry(store, i);
+      return m ? { isBot: !!m.is_bot, text: typeof m.message === "string" ? m.message : null, raw: m } : null;
+    });
+    return {
+      title: (character.name || charName).trim(),
+      charName,
+      userName: ((persona && persona.name) || "You").trim(),
+      personaAbout: persona ? persona.appearance || "" : null,
+      messages,
+    };
+  }
+
+  function buildMarkdown(includePersona) {
+    const chat = site.chatData();
+    if (!chat) return null;
+    const { charName, userName, title } = chat;
     // Greetings and some replies still hold the {{user}} / {{char}} macros.
     // Single line breaks become Markdown hard breaks (two trailing spaces)
     // so they don't get merged into one paragraph when the file is viewed.
@@ -625,22 +666,21 @@
       .replace(/[ \t]*\n(?!\n)/g, (m, off, str) => (off > 0 && str[off - 1] === "\n" ? "\n" : "  \n"));
 
     const out = [`# ${title}`, ""];
-    const count = store.messages.length;
-    out.push(`_Exported from [JanitorAI](${location.href}) on ${new Date().toLocaleString()} · ${count} message${count === 1 ? "" : "s"}_`, "");
+    const count = chat.messages.length;
+    out.push(`_Exported from [${site.label}](${location.href}) on ${new Date().toLocaleString()} · ${count} message${count === 1 ? "" : "s"}_`, "");
 
-    if (includePersona && persona) {
+    if (includePersona && chat.personaAbout !== null) {
       out.push(`## Persona: ${userName}`, "");
-      const about = persona.appearance ? fill(persona.appearance).trim() : "";
+      const about = chat.personaAbout ? fill(chat.personaAbout).trim() : "";
       out.push(about || "_No persona description._", "");
     }
 
     out.push("---", "");
-    for (let i = 0; i < count; i++) {
-      const m = resolveEntry(store, i);
-      if (!m) continue;
-      out.push(`### #${i + 1} · ${m.is_bot ? charName : userName}`, "");
-      out.push(fill(typeof m.message === "string" ? m.message : "").trim(), "");
-    }
+    chat.messages.forEach((m, i) => {
+      if (!m) return;
+      out.push(`### #${i + 1} · ${m.isBot ? charName : userName}`, "");
+      out.push(fill(m.text || "").trim(), "");
+    });
     return { text: out.join("\n").replace(/\n{3,}/g, "\n\n"), title, count };
   }
 
@@ -712,9 +752,9 @@
       fly = buildExportFlyout();
       document.body.appendChild(fly);
     }
-    const cs = getChatStore();
-    const n = cs ? cs.messagesStore.messages.length : 0;
-    setExportStatus(cs ? `${n} message${n === 1 ? "" : "s"}` : "Chat not loaded yet");
+    const chat = site.chatData();
+    const n = chat ? chat.messages.length : 0;
+    setExportStatus(chat ? `${n} message${n === 1 ? "" : "s"}` : "Chat not loaded yet");
     fly.hidden = false;
     btn.setAttribute("aria-expanded", "true");
     positionFlyout(fly, btn);
@@ -733,7 +773,7 @@
   }
 
   function ensureExportButton() {
-    const left = document.querySelector('[class*="controlsLeft"]');
+    const left = site.controls();
     if (!left) {
       if (isExportOpen()) closeExportFlyout();
       return;
@@ -774,9 +814,9 @@
    * confirm flyout that says how many older bot replies still carry a
    * tracker line (cfg.trackerRegex). Confirming removes that line from
    * each of them, keeping the newest cfg.keepTrackerCount bot replies as
-   * they are, and saves every edit through the site's own
-   * messagesStore.editMessage (the same call the edit box's Save uses),
-   * so the change is saved on JanitorAI, not just hidden.
+   * they are, and saves every edit through the site adapter (on
+   * JanitorAI, messagesStore.editMessage, the same call the edit box's
+   * Save uses), so the change is saved on the site, not just hidden.
    ******************************************************************/
   const STRIP_BTN_ID = "jct-strip-btn";
   const STRIP_FLYOUT_ID = "jct-strip-flyout";
@@ -792,30 +832,24 @@
   }
 
   function keepCount() {
-    return Math.max(0, parseInt(cfg.keepTrackerCount, 10) || 0);
+    return Math.max(site.minKeep, parseInt(cfg.keepTrackerCount, 10) || 0);
   }
 
   // Older bot replies that still contain a tracker, with the text each one
   // should be saved as.
   function findStripTargets() {
-    const cs = getChatStore();
-    if (!cs) return null;
-    const store = cs.messagesStore;
-    const bots = [];
-    for (let i = 0; i < store.messages.length; i++) {
-      const m = resolveEntry(store, i);
-      if (m && m.is_bot) bots.push(m);
-    }
+    const chat = site.chatData();
+    if (!chat) return null;
+    const bots = chat.messages.filter((m) => m && m.isBot);
     const keep = keepCount();
     const older = keep > 0 ? bots.slice(0, -keep) : bots;
     const targets = [];
     for (const m of older) {
-      if (typeof m.message !== "string") continue;
-      if (typeof store.canEditMessage === "function" && !store.canEditMessage(m)) continue;
-      const text = m.message.replace(trackerRegex(), "").replace(/\s+$/, "");
-      if (text !== m.message.replace(/\s+$/, "") && text.trim()) targets.push({ m, text });
+      if (typeof m.text !== "string" || !site.canEdit(m)) continue;
+      const text = m.text.replace(trackerRegex(), "").replace(/\s+$/, "");
+      if (text !== m.text.replace(/\s+$/, "") && text.trim()) targets.push({ m, text });
     }
-    return { store, targets };
+    return { targets };
   }
 
   function setStripStatus(text) {
@@ -855,15 +889,13 @@
     stripRunning = true;
     const go = document.querySelector(`#${STRIP_FLYOUT_ID} .jct-strip-go`);
     if (go) go.disabled = true;
-    const { store, targets } = found;
+    const { targets } = found;
     let done = 0;
     let failed = 0;
     for (const t of targets) {
       setStripStatus(`Saving ${done + failed + 1} of ${targets.length}…`);
-      // editMessage quietly does nothing while another edit is in flight.
-      for (let w = 0; w < 50 && store.isMessageProcessing; w++) await sleep(100);
       let ok = false;
-      try { ok = await store.editMessage(t.m, t.text); } catch (e) { ok = false; }
+      try { ok = await site.editMessage(t.m, t.text); } catch (e) { ok = false; }
       if (ok) done++;
       else failed++;
     }
@@ -920,7 +952,7 @@
   }
 
   function ensureStripButton() {
-    const left = document.querySelector('[class*="controlsLeft"]');
+    const left = site.controls();
     if (!left) {
       if (isStripOpen()) closeStripFlyout();
       return;
@@ -976,6 +1008,70 @@
   window.addEventListener("resize", () => { if (keepHeaderIcons()) scheduleTag(); });
 
   /******************************************************************
+   * Site adapters
+   *
+   * Everything the shared features need from the page:
+   *   label            site name used in the export and settings title
+   *   styling          whether the bubble, width and header tweaks apply
+   *   minKeep          fewest newest bot replies that must keep their tracker
+   *   controls()       bottom-bar element our buttons are added to (null = none)
+   *   inputBox(btn)    box the flyouts sit above
+   *   listMessages()   [{ isBot }] for the jump grid
+   *   currentIndex()   index of the message at the top of the screen
+   *   jumpTo(i)        scroll to message i (async, returns true/false)
+   *   messageText(i)   raw text of message i, or null
+   *   chatData()       { title, charName, userName, personaAbout, messages:
+   *                    [{ isBot, text, raw } | null] } or null
+   *   canEdit(m)       whether message m (from chatData) can be saved
+   *   editMessage(m, text)  save new text through the site (async, true/false)
+   ******************************************************************/
+  const ADAPTERS = {
+    janitor: {
+      label: "JanitorAI",
+      styling: true,
+      minKeep: 0,
+      controls: () => document.querySelector('[class*="controlsLeft"]'),
+      inputBox: (btn) => btn.closest('[class*="chatInputInner"]'),
+      listMessages: jaiListMessages,
+      currentIndex: jaiCurrentIndex,
+      jumpTo: jaiJumpTo,
+      messageText: jaiMessageText,
+      chatData: jaiChatData,
+      canEdit(m) {
+        const store = getMessagesStore();
+        return !!store && (typeof store.canEditMessage !== "function" || store.canEditMessage(m.raw));
+      },
+      async editMessage(m, text) {
+        const store = getMessagesStore();
+        if (!store) return false;
+        // editMessage quietly does nothing while another edit is in flight.
+        for (let w = 0; w < 50 && store.isMessageProcessing; w++) await sleep(100);
+        return !!(await store.editMessage(m.raw, text));
+      },
+    },
+
+    // Saucepan: not wired to the page yet. Until its chat page has been
+    // inspected, controls() finds nothing, so no buttons are added; the
+    // settings panel still opens from the userscript manager's menu.
+    saucepan: {
+      label: "Saucepan",
+      styling: false,
+      minKeep: 1,
+      controls: () => null,
+      inputBox: () => null,
+      listMessages: () => [],
+      currentIndex: () => -1,
+      jumpTo: async () => false,
+      messageText: () => null,
+      chatData: () => null,
+      canEdit: () => false,
+      editMessage: async () => false,
+    },
+  };
+  const site = ADAPTERS[SITE];
+
+
+  /******************************************************************
    * Settings panel
    *
    * A gear button at the end of the bottom bar (and a "Chat Tweaks
@@ -987,32 +1083,40 @@
   const SETTINGS_OVERLAY_ID = "jct-settings-overlay";
 
   const FIELDS = [
-    { section: "Chat bubbles" },
-    { key: "bubbles", label: "Bubble style", type: "select", options: [
+    { section: "Chat bubbles", styling: true },
+    { styling: true, key: "bubbles", label: "Bubble style", type: "select", options: [
       ["joined", "One per message"],
       ["separated", "One per paragraph"],
       ["none", "None"],
     ] },
-    { key: "alternating", label: "Right-aligned messages", type: "select", options: [
+    { styling: true, key: "alternating", label: "Right-aligned messages", type: "select", options: [
       ["off", "None"],
       ["userRight", "My messages"],
       ["botRight", "Bot messages"],
       ["bothRight", "Both"],
     ] },
-    { key: "chatWidthPct", label: "Chat width (% of window)", hint: "0 keeps the site's own width.", type: "number", min: 0, max: 100 },
-    { key: "userBubble", label: "My bubble color", type: "color" },
-    { key: "darkenBotFromUser", label: "Make the bot bubble a darker shade of mine", type: "checkbox" },
-    { key: "botBubble", label: "Bot bubble color", type: "color", disabledIf: (v) => v.darkenBotFromUser },
-    { key: "botDarkenPct", label: "How much darker (%)", type: "number", min: 0, max: 100, disabledIf: (v) => !v.darkenBotFromUser },
-    { section: "Header" },
-    { key: "hideMusicPlayer", label: "Remove the music player", hint: "Turning this back off needs a page reload to bring the player back.", type: "checkbox" },
-    { key: "autoHideHeader", label: "Hide the header until I hover the top edge", type: "checkbox" },
-    { key: "alwaysShowProxyIcon", label: "Keep the proxy badge visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
-    { key: "alwaysShowMenuIcon", label: "Keep the ☰ menu button visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
+    { styling: true, key: "chatWidthPct", label: "Chat width (% of window)", hint: "0 keeps the site's own width.", type: "number", min: 0, max: 100 },
+    { styling: true, key: "userBubble", label: "My bubble color", type: "color" },
+    { styling: true, key: "darkenBotFromUser", label: "Make the bot bubble a darker shade of mine", type: "checkbox" },
+    { styling: true, key: "botBubble", label: "Bot bubble color", type: "color", disabledIf: (v) => v.darkenBotFromUser },
+    { styling: true, key: "botDarkenPct", label: "How much darker (%)", type: "number", min: 0, max: 100, disabledIf: (v) => !v.darkenBotFromUser },
+    { section: "Header", styling: true },
+    { styling: true, key: "hideMusicPlayer", label: "Remove the music player", hint: "Turning this back off needs a page reload to bring the player back.", type: "checkbox" },
+    { styling: true, key: "autoHideHeader", label: "Hide the header until I hover the top edge", type: "checkbox" },
+    { styling: true, key: "alwaysShowProxyIcon", label: "Keep the proxy badge visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
+    { styling: true, key: "alwaysShowMenuIcon", label: "Keep the ☰ menu button visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
     { section: "Story notes stripper (eraser button)" },
     { key: "trackerRegex", label: "Tracker pattern (regular expression)", hint: "Used with the g, i and m flags.", type: "text", mono: true },
     { key: "keepTrackerCount", label: "Newest bot replies that keep their tracker", type: "number", min: 0, max: 999 },
-  ];
+  ].filter((f) => site.styling || !f.styling);
+  // Saucepan carries its GM notebook forward from the newest tracker, so at
+  // least one has to stay.
+  for (const f of FIELDS) {
+    if (f.key === "keepTrackerCount" && site.minKeep > 0) {
+      f.min = site.minKeep;
+      f.hint = `At least ${site.minKeep}, so the newest notes (and the notebook they carry forward) stay.`;
+    }
+  }
 
   function hexToRgb(hex) {
     const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
@@ -1160,7 +1264,7 @@
     overlay.innerHTML = `
       <div class="jct-set-panel" role="dialog" aria-modal="true" aria-labelledby="jct-set-title">
         <div class="jct-set-head">
-          <h2 id="jct-set-title">Chat Tweaks settings</h2>
+          <h2 id="jct-set-title">Chat Tweaks settings · ${site.label}</h2>
           <button type="button" class="jct-set-x" aria-label="Close">×</button>
         </div>
         <div class="jct-set-body"></div>
@@ -1221,7 +1325,7 @@
   }
 
   function ensureSettingsButton() {
-    const left = document.querySelector('[class*="controlsLeft"]');
+    const left = site.controls();
     if (!left) return;
     // Keep it at the end of our buttons, right of Export.
     const prev = left.querySelector(`#${EXPORT_BTN_ID}`);
@@ -1550,6 +1654,14 @@ ${keepIconSel ? `
 ` : ""}
 ` : ""}
 
+/* ===== Small quality-of-life ===== */
+.chat-input-inner { background: none !important; }
+`.trim();
+  return (site.styling ? css + "\n" : "") + UI_CSS + "\n" + SETTINGS_CSS;
+  }
+
+  // Our buttons and flyouts; the same on every site.
+  const UI_CSS = `
 /* ===== Message jump & copy picker ===== */
 #jct-jump-btn,
 #jct-strip-btn,
@@ -1738,12 +1850,7 @@ ${keepIconSel ? `
   white-space: nowrap;
   color: rgba(255, 255, 255, 0.6);
 }
-
-/* ===== Small quality-of-life ===== */
-.chat-input-inner { background: none !important; }
 `.trim();
-  return css + "\n" + SETTINGS_CSS;
-  }
 
   // One <style> element, rewritten whenever settings are saved.
   let styleEl = null;
