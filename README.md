@@ -1,6 +1,12 @@
 # JanitorAiChatTweaks
 
-Tampermonkey userscript that tweaks the JanitorAI chat page.
+Tampermonkey userscript that tweaks the JanitorAI and Saucepan.ai chat pages.
+
+## Saucepan.ai
+
+The script also runs on saucepan.ai, with its own saved settings. There it adds only the bottom bar tools (jump/copy, eraser, export, settings), not the bubble, width or header styling. The eraser's default pattern matches Saucepan's story notes line (`>!{...}!<`, also when it ends `!<>` or sits inside `<notes>` tags), and at least the newest bot reply always keeps its notes, because the GM notebook is carried forward from it.
+
+The export has no persona option on Saucepan.
 
 ## Settings
 

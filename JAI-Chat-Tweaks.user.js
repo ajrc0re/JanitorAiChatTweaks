@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
-// @version      1.7.1
-// @description  Improves the JanitorAI Chat Interface
+// @version      1.8.0
+// @description  Improves the JanitorAI and Saucepan chat interfaces
 // @match        https://janitorai.com/*
+// @match        https://saucepan.ai/*
+// @match        https://www.saucepan.ai/*
 // @run-at       document-start
 // @grant        GM_addStyle
 // @grant        GM_getValue
@@ -53,7 +55,30 @@
     keepTrackerCount: 3,
   };
 
-  const SETTINGS_KEY = "settings";
+  /******************************************************************
+   * Site detection
+   *
+   * The script runs on JanitorAI and Saucepan. Each site gets its own
+   * saved settings and can override defaults here. Everything that reads
+   * the page goes through the site adapter (`site`, defined further down),
+   * so the buttons, flyouts and settings panel are shared.
+   ******************************************************************/
+  const SITE = /(^|\.)saucepan\.ai$/i.test(location.hostname) ? "saucepan" : "janitor";
+
+  const SITE_DEFAULTS = {
+    janitor: {},
+    saucepan: {
+      // Saucepan's story notes are the final line of a reply: one line of
+      // minified JSON in spoiler tags, >!{...}!<, sometimes still wrapped in
+      // <notes> ... </notes>. Models often slip into ending it with !<> and
+      // dropping a closing brace, so the JSON doesn't have to be valid.
+      trackerRegex: String.raw`\s*^[ \t]*(?:<notes>\s*)?>!\s*\{.*\}\s*!<>?(?:\s*<\/notes>)?[ \t]*$`,
+    },
+  };
+  Object.assign(DEFAULTS, SITE_DEFAULTS[SITE]);
+
+  // JanitorAI keeps the original key so existing settings carry over.
+  const SETTINGS_KEY = SITE === "janitor" ? "settings" : "settings-" + SITE;
 
   // GM storage when the manager provides it, localStorage otherwise.
   function storageGet() {
@@ -189,7 +214,7 @@
   // How far the auto-hidden header is slid up, so icons kept visible can be
   // slid back down by the same amount and stay where they normally sit.
   function keepHeaderIcons() {
-    return cfg.autoHideHeader && (cfg.alwaysShowProxyIcon || cfg.alwaysShowMenuIcon);
+    return site.styling && cfg.autoHideHeader && (cfg.alwaysShowProxyIcon || cfg.alwaysShowMenuIcon);
   }
   function updateHeaderShift() {
     const header = document.querySelector('[data-chat-header="true"]');
@@ -201,9 +226,11 @@
   }
 
   function tagAll() {
-    document.querySelectorAll(BODY_SEL).forEach(tagMessage);
-    if (cfg.hideMusicPlayer) killMusicPlayer();
-    if (keepHeaderIcons()) updateHeaderShift();
+    if (site.styling) {
+      document.querySelectorAll(BODY_SEL).forEach(tagMessage);
+      if (cfg.hideMusicPlayer) killMusicPlayer();
+      if (keepHeaderIcons()) updateHeaderShift();
+    }
     ensureJumpButton();
     ensureStripButton();
     ensureExportButton();
@@ -298,7 +325,7 @@
   }
 
   // Message list as [{ isBot }], from the store or, failing that, the DOM.
-  function listMessages() {
+  function jaiListMessages() {
     const store = getMessagesStore();
     if (store) {
       return store.messages.map((_, i) => {
@@ -323,7 +350,7 @@
   }
 
   // Index of the message at the top of the screen, to highlight in the grid.
-  function currentIndex() {
+  function jaiCurrentIndex() {
     const top = viewTop();
     let best = -1;
     for (const el of document.querySelectorAll("[data-index]")) {
@@ -338,7 +365,7 @@
     return idx.length ? [Math.min(...idx), Math.max(...idx)] : null;
   }
 
-  async function jumpTo(i) {
+  async function jaiJumpTo(i) {
     const sc = getScroller();
     if (!sc) return false;
     const store = getMessagesStore();
@@ -385,7 +412,7 @@
     return true;
   }
 
-  function messageText(i) {
+  function jaiMessageText(i) {
     const store = getMessagesStore();
     if (store) {
       const m = resolveEntry(store, i);
@@ -437,7 +464,7 @@
 
   function pick(i) {
     if (copyMode) {
-      const text = messageText(i);
+      const text = site.messageText(i);
       if (text == null) {
         setStatus(`Couldn't read #${i + 1}`);
         return;
@@ -452,7 +479,7 @@
       return;
     }
     closeFlyout();
-    jumpTo(i);
+    site.jumpTo(i);
   }
 
   function buildFlyout() {
@@ -490,7 +517,7 @@
     // Line up with the button, but sit above the whole input box so the
     // flyout never covers what you're typing.
     const r = btn.getBoundingClientRect();
-    const box = btn.closest('[class*="chatInputInner"]') || btn;
+    const box = site.inputBox(btn) || btn;
     const top = Math.min(r.top, box.getBoundingClientRect().top);
     const margin = 8;
     fly.style.left = `${Math.max(margin, Math.min(r.left, window.innerWidth - fly.offsetWidth - margin))}px`;
@@ -503,8 +530,8 @@
       fly = buildFlyout();
       document.body.appendChild(fly);
     }
-    const msgs = listMessages();
-    const current = currentIndex();
+    const msgs = site.listMessages();
+    const current = site.currentIndex();
     const grid = fly.querySelector(".jct-jump-grid");
     grid.innerHTML = msgs
       .map((m, i) => {
@@ -539,7 +566,7 @@
   // Called from the MutationObserver pass: (re)insert the button whenever
   // React re-renders the bottom bar or you switch chats.
   function ensureJumpButton() {
-    const left = document.querySelector('[class*="controlsLeft"]');
+    const left = site.controls();
     if (!left) {
       if (isFlyoutOpen()) closeFlyout();
       return;
@@ -604,17 +631,32 @@
     return list.find((p) => p && p.id === wanted) || active || list.find((p) => p && p.is_default) || null;
   }
 
-  function buildMarkdown(includePersona) {
+  // JanitorAI: the chat in the shape the export and the stripper use.
+  function jaiChatData() {
     const cs = getChatStore();
     if (!cs) return null;
     const store = cs.messagesStore;
     const info = cs.chatInfo || {};
     const character = info.character || {};
     const persona = chatPersona(cs);
-
     const charName = (character.chat_name || character.name || "Character").trim();
-    const userName = ((persona && persona.name) || "You").trim();
-    const title = (character.name || charName).trim();
+    const messages = store.messages.map((_, i) => {
+      const m = resolveEntry(store, i);
+      return m ? { isBot: !!m.is_bot, text: typeof m.message === "string" ? m.message : null, raw: m } : null;
+    });
+    return {
+      title: (character.name || charName).trim(),
+      charName,
+      userName: ((persona && persona.name) || "You").trim(),
+      personaAbout: persona ? persona.appearance || "" : null,
+      messages,
+    };
+  }
+
+  function buildMarkdown(includePersona) {
+    const chat = site.chatData();
+    if (!chat) return null;
+    const { charName, userName, title } = chat;
     // Greetings and some replies still hold the {{user}} / {{char}} macros.
     // Single line breaks become Markdown hard breaks (two trailing spaces)
     // so they don't get merged into one paragraph when the file is viewed.
@@ -625,22 +667,21 @@
       .replace(/[ \t]*\n(?!\n)/g, (m, off, str) => (off > 0 && str[off - 1] === "\n" ? "\n" : "  \n"));
 
     const out = [`# ${title}`, ""];
-    const count = store.messages.length;
-    out.push(`_Exported from [JanitorAI](${location.href}) on ${new Date().toLocaleString()} · ${count} message${count === 1 ? "" : "s"}_`, "");
+    const count = chat.messages.length;
+    out.push(`_Exported from [${site.label}](${location.href}) on ${new Date().toLocaleString()} · ${count} message${count === 1 ? "" : "s"}_`, "");
 
-    if (includePersona && persona) {
+    if (includePersona && chat.personaAbout !== null) {
       out.push(`## Persona: ${userName}`, "");
-      const about = persona.appearance ? fill(persona.appearance).trim() : "";
+      const about = chat.personaAbout ? fill(chat.personaAbout).trim() : "";
       out.push(about || "_No persona description._", "");
     }
 
     out.push("---", "");
-    for (let i = 0; i < count; i++) {
-      const m = resolveEntry(store, i);
-      if (!m) continue;
-      out.push(`### #${i + 1} · ${m.is_bot ? charName : userName}`, "");
-      out.push(fill(typeof m.message === "string" ? m.message : "").trim(), "");
-    }
+    chat.messages.forEach((m, i) => {
+      if (!m) return;
+      out.push(`### #${i + 1} · ${m.isBot ? charName : userName}`, "");
+      out.push(fill(m.text || "").trim(), "");
+    });
     return { text: out.join("\n").replace(/\n{3,}/g, "\n\n"), title, count };
   }
 
@@ -699,6 +740,7 @@
       </div>
     `;
     const box = fly.querySelector(".jct-export-persona");
+    if (site.hasPersona === false) box.closest("label").hidden = true;
     box.checked = readPref(PERSONA_PREF_KEY, false);
     box.addEventListener("change", () => writePref(PERSONA_PREF_KEY, box.checked));
     fly.querySelector(".jct-export-go").addEventListener("click", doExport);
@@ -712,9 +754,9 @@
       fly = buildExportFlyout();
       document.body.appendChild(fly);
     }
-    const cs = getChatStore();
-    const n = cs ? cs.messagesStore.messages.length : 0;
-    setExportStatus(cs ? `${n} message${n === 1 ? "" : "s"}` : "Chat not loaded yet");
+    const chat = site.chatData();
+    const n = chat ? chat.messages.length : 0;
+    setExportStatus(chat ? `${n} message${n === 1 ? "" : "s"}` : "Chat not loaded yet");
     fly.hidden = false;
     btn.setAttribute("aria-expanded", "true");
     positionFlyout(fly, btn);
@@ -733,7 +775,7 @@
   }
 
   function ensureExportButton() {
-    const left = document.querySelector('[class*="controlsLeft"]');
+    const left = site.controls();
     if (!left) {
       if (isExportOpen()) closeExportFlyout();
       return;
@@ -774,9 +816,9 @@
    * confirm flyout that says how many older bot replies still carry a
    * tracker line (cfg.trackerRegex). Confirming removes that line from
    * each of them, keeping the newest cfg.keepTrackerCount bot replies as
-   * they are, and saves every edit through the site's own
-   * messagesStore.editMessage (the same call the edit box's Save uses),
-   * so the change is saved on JanitorAI, not just hidden.
+   * they are, and saves every edit through the site adapter (on
+   * JanitorAI, messagesStore.editMessage, the same call the edit box's
+   * Save uses), so the change is saved on the site, not just hidden.
    ******************************************************************/
   const STRIP_BTN_ID = "jct-strip-btn";
   const STRIP_FLYOUT_ID = "jct-strip-flyout";
@@ -792,30 +834,24 @@
   }
 
   function keepCount() {
-    return Math.max(0, parseInt(cfg.keepTrackerCount, 10) || 0);
+    return Math.max(site.minKeep, parseInt(cfg.keepTrackerCount, 10) || 0);
   }
 
   // Older bot replies that still contain a tracker, with the text each one
   // should be saved as.
   function findStripTargets() {
-    const cs = getChatStore();
-    if (!cs) return null;
-    const store = cs.messagesStore;
-    const bots = [];
-    for (let i = 0; i < store.messages.length; i++) {
-      const m = resolveEntry(store, i);
-      if (m && m.is_bot) bots.push(m);
-    }
+    const chat = site.chatData();
+    if (!chat) return null;
+    const bots = chat.messages.filter((m) => m && m.isBot);
     const keep = keepCount();
     const older = keep > 0 ? bots.slice(0, -keep) : bots;
     const targets = [];
     for (const m of older) {
-      if (typeof m.message !== "string") continue;
-      if (typeof store.canEditMessage === "function" && !store.canEditMessage(m)) continue;
-      const text = m.message.replace(trackerRegex(), "").replace(/\s+$/, "");
-      if (text !== m.message.replace(/\s+$/, "") && text.trim()) targets.push({ m, text });
+      if (typeof m.text !== "string" || !site.canEdit(m)) continue;
+      const text = m.text.replace(trackerRegex(), "").replace(/\s+$/, "");
+      if (text !== m.text.replace(/\s+$/, "") && text.trim()) targets.push({ m, text });
     }
-    return { store, targets };
+    return { targets };
   }
 
   function setStripStatus(text) {
@@ -855,22 +891,35 @@
     stripRunning = true;
     const go = document.querySelector(`#${STRIP_FLYOUT_ID} .jct-strip-go`);
     if (go) go.disabled = true;
-    const { store, targets } = found;
+    const { targets } = found;
+    // If the chat changed somewhere else (another tab or device), the page's
+    // copy is out of date and the wrong replies would count as "older".
+    if (site.checkFresh) {
+      setStripStatus("Checking the chat is up to date…");
+      let problem = null;
+      try { problem = await site.checkFresh(targets); } catch (e) { problem = "Couldn't check the chat is up to date."; }
+      if (problem) {
+        stripRunning = false;
+        if (go) go.disabled = false;
+        setStripStatus(problem);
+        return;
+      }
+    }
     let done = 0;
-    let failed = 0;
+    let failed = false;
     for (const t of targets) {
-      setStripStatus(`Saving ${done + failed + 1} of ${targets.length}…`);
-      // editMessage quietly does nothing while another edit is in flight.
-      for (let w = 0; w < 50 && store.isMessageProcessing; w++) await sleep(100);
+      setStripStatus(`Saving ${done + 1} of ${targets.length}…`);
       let ok = false;
-      try { ok = await store.editMessage(t.m, t.text); } catch (e) { ok = false; }
-      if (ok) done++;
-      else failed++;
+      try { ok = await site.editMessage(t.m, t.text); } catch (e) { ok = false; }
+      if (!ok) { failed = true; break; }
+      done++;
     }
     stripRunning = false;
     refreshStripFlyout();
+    // Stop at the first failure: it usually means the chat changed, and the
+    // rest would fail (or hit the wrong replies) too.
     setStripStatus(failed
-      ? `Cleaned ${done}, ${failed} failed`
+      ? `Cleaned ${done}, then a save failed. Stopped; reload and try again.`
       : `Cleaned ${done} repl${done === 1 ? "y" : "ies"}`);
   }
 
@@ -920,7 +969,7 @@
   }
 
   function ensureStripButton() {
-    const left = document.querySelector('[class*="controlsLeft"]');
+    const left = site.controls();
     if (!left) {
       if (isStripOpen()) closeStripFlyout();
       return;
@@ -976,6 +1025,251 @@
   window.addEventListener("resize", () => { if (keepHeaderIcons()) scheduleTag(); });
 
   /******************************************************************
+   * Saucepan page access
+   *
+   * Saucepan is a React app whose chat list is react-virtuoso
+   * ([data-testid="virtuoso-scroller"], rows [data-item-index]), so only
+   * about a dozen rows exist in the DOM. Class names come from
+   * styled-components and change between builds, so we rely on aria
+   * labels, data attributes and the list's own props instead. Those props
+   * (found through React's fiber links from a rendered row) hold every
+   * message group (allGroups), the selected variant per response group,
+   * scrollToTopOfMessageByIndex, and onUpdateMessage, which is the app's
+   * own edit save (optimistic update, POST commit-message-edit, rollback
+   * on failure).
+   ******************************************************************/
+  const SP_ROW_SEL = '[data-testid="virtuoso-scroller"] [data-item-index]';
+
+  function spScroller() {
+    return document.querySelector('[data-testid="virtuoso-scroller"]');
+  }
+
+  function spListProps() {
+    for (const row of document.querySelectorAll(SP_ROW_SEL)) {
+      for (const start of [row.firstElementChild, row]) {
+        if (!start) continue;
+        const key = Object.keys(start).find((k) => k.startsWith("__reactFiber"));
+        let f = key && start[key];
+        for (let depth = 0; f && depth < 12; depth++, f = f.return) {
+          const p = f.memoizedProps;
+          if (p && Array.isArray(p.allGroups)) return p;
+        }
+      }
+    }
+    return null;
+  }
+
+  // The variant of a group that's on screen.
+  function spPickMessage(group, selected) {
+    const list = (group && Array.isArray(group.messages) ? group.messages : []).filter(Boolean);
+    if (!list.length) return null;
+    const rg = list[0].responseGroup;
+    const wanted = selected && rg != null ? selected[rg] : null;
+    return (wanted && list.find((m) => m.id === wanted)) || list.find((m) => m.isCanonical) || list[list.length - 1];
+  }
+
+  function spChatData() {
+    const props = spListProps();
+    if (!props) return null;
+    const selected = props.selectedVariantByResponseGroup || {};
+    const messages = props.allGroups.map((g) => {
+      const m = spPickMessage(g, selected);
+      return m ? { isBot: m.role !== "user", text: typeof m.content === "string" ? m.content : null, raw: m } : null;
+    });
+    const bot = messages.find((m) => m && m.isBot && m.raw.author);
+    const user = messages.find((m) => m && !m.isBot && m.raw.author);
+    const charName = String((bot && bot.raw.author) || "Character").trim();
+    const titleBtn = document.querySelector('button[aria-label="Edit chat title"]');
+    const title = ((titleBtn && titleBtn.textContent) || "").trim() || charName;
+    return {
+      title,
+      charName,
+      userName: String((user && user.raw.author) || "You").trim(),
+      personaAbout: null,
+      messages,
+    };
+  }
+
+  // The bottom bar row that holds "Response instructions", "Command" and
+  // "Open editor". Each of those sits in its own span wrapper.
+  function spControls() {
+    const b = document.querySelector('button[aria-label="Open editor"]');
+    if (!b || !b.parentElement) return null;
+    return b.parentElement.tagName === "SPAN" ? b.parentElement.parentElement : b.parentElement;
+  }
+
+  // Smallest box holding both the message textarea and our button.
+  function spInputBox(btn) {
+    const ta = document.querySelector('textarea[placeholder="Write something."]');
+    for (let e = ta; e && e !== document.body; e = e.parentElement) {
+      if (e.contains(btn)) return e;
+    }
+    return null;
+  }
+
+  function spCurrentIndex() {
+    const sc = spScroller();
+    const top = sc ? sc.getBoundingClientRect().top + 8 : 0;
+    let best = -1;
+    for (const el of document.querySelectorAll(SP_ROW_SEL)) {
+      const r = el.getBoundingClientRect();
+      const i = +el.dataset.itemIndex;
+      if (r.bottom > top && (best < 0 || i < best)) best = i;
+    }
+    return best;
+  }
+
+  async function spJumpTo(i) {
+    const props = spListProps();
+    if (!props || typeof props.scrollToTopOfMessageByIndex !== "function") return false;
+    props.scrollToTopOfMessageByIndex(i);
+    let el = null;
+    for (let step = 0; step < 60 && !el; step++) {
+      await frame();
+      el = document.querySelector(`[data-testid="virtuoso-scroller"] [data-item-index="${i}"]`);
+    }
+    if (!el) return false;
+    // Virtuoso re-measures rows as they render, so ask once more.
+    await sleep(60);
+    props.scrollToTopOfMessageByIndex(i);
+    await sleep(60);
+    el = document.querySelector(`[data-testid="virtuoso-scroller"] [data-item-index="${i}"]`) || el;
+    const msg = el.firstElementChild || el;
+    msg.classList.remove("jct-flash");
+    void msg.offsetWidth; // restart the animation
+    msg.classList.add("jct-flash");
+    setTimeout(() => msg.classList.remove("jct-flash"), 1600);
+    return true;
+  }
+
+  // Compare the page's copy with the server's (read-only request, the same
+  // one the app makes when it opens a chat, with the app's own token). The
+  // newest message and every reply about to be edited must still be there.
+  // Returns null when it's safe to edit, else why not. If the check can't
+  // run, nothing is edited.
+  async function spCheckFresh(targets) {
+    const CANT = "Couldn't check the chat is up to date. Nothing was changed.";
+    const STALE = "Chat changed elsewhere. Reload the page first.";
+    const props = spListProps();
+    let token = null;
+    try { token = localStorage.getItem("hallucination/auth_token"); } catch (e) { token = null; }
+    if (!props || !props.chatId || !token) return CANT;
+    const res = await fetch(`/api/v1/core/chat-state?chat_id=${encodeURIComponent(props.chatId)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) return CANT;
+    const data = await res.json();
+    if (!data || !Array.isArray(data.messages)) return CANT;
+    const ids = new Set(data.messages.map((m) => m && m.id));
+    const chat = spChatData();
+    const last = chat && chat.messages[chat.messages.length - 1];
+    const newestServer = data.messages[data.messages.length - 1];
+    const known = new Set(props.allGroups.flatMap((g) => (g && g.messages ? g.messages.map((m) => m && m.id) : [])));
+    if (newestServer && !known.has(newestServer.id)) return STALE;
+    if (last && !ids.has(last.raw.id)) return STALE;
+    return targets.every((t) => ids.has(t.m.raw.id)) ? null : STALE;
+  }
+
+  // Save through the app's own onUpdateMessage, then confirm the store
+  // holds the new text (it rolls back if the save fails).
+  async function spEditMessage(m, text) {
+    const id = m.raw.id;
+    const current = () => {
+      const chat = spChatData();
+      const hit = chat && chat.messages.find((x) => x && x.raw.id === id);
+      return hit ? hit.text : null;
+    };
+    for (let w = 0; w < 100; w++) {
+      const p = spListProps();
+      if (p && !p.isGenerating) break;
+      await sleep(100);
+    }
+    const props = spListProps();
+    if (!props || typeof props.onUpdateMessage !== "function") return false;
+    await props.onUpdateMessage(Object.assign({}, m.raw, { content: text }));
+    // Give a failed save time to roll back before checking.
+    for (let w = 0; w < 15; w++) {
+      await sleep(100);
+      if (current() !== text) return false;
+    }
+    return current() === text;
+  }
+
+  /******************************************************************
+   * Site adapters
+   *
+   * Everything the shared features need from the page:
+   *   label            site name used in the export and settings title
+   *   styling          whether the bubble, width and header tweaks apply
+   *   minKeep          fewest newest bot replies that must keep their tracker
+   *   controls()       bottom-bar element our buttons are added to (null = none)
+   *   inputBox(btn)    box the flyouts sit above
+   *   listMessages()   [{ isBot }] for the jump grid
+   *   currentIndex()   index of the message at the top of the screen
+   *   jumpTo(i)        scroll to message i (async, returns true/false)
+   *   messageText(i)   raw text of message i, or null
+   *   chatData()       { title, charName, userName, personaAbout, messages:
+   *                    [{ isBot, text, raw } | null] } or null
+   *   canEdit(m)       whether message m (from chatData) can be saved
+   *   editMessage(m, text)  save new text through the site (async, true/false)
+   *   checkFresh(targets)   optional: null if safe to edit, else a reason (async)
+   ******************************************************************/
+  const ADAPTERS = {
+    janitor: {
+      label: "JanitorAI",
+      styling: true,
+      minKeep: 0,
+      controls: () => document.querySelector('[class*="controlsLeft"]'),
+      inputBox: (btn) => btn.closest('[class*="chatInputInner"]'),
+      listMessages: jaiListMessages,
+      currentIndex: jaiCurrentIndex,
+      jumpTo: jaiJumpTo,
+      messageText: jaiMessageText,
+      chatData: jaiChatData,
+      canEdit(m) {
+        const store = getMessagesStore();
+        return !!store && (typeof store.canEditMessage !== "function" || store.canEditMessage(m.raw));
+      },
+      async editMessage(m, text) {
+        const store = getMessagesStore();
+        if (!store) return false;
+        // editMessage quietly does nothing while another edit is in flight.
+        for (let w = 0; w < 50 && store.isMessageProcessing; w++) await sleep(100);
+        return !!(await store.editMessage(m.raw, text));
+      },
+    },
+
+    saucepan: {
+      label: "Saucepan",
+      styling: false,
+      minKeep: 1,
+      hasPersona: false,
+      controls: spControls,
+      inputBox: spInputBox,
+      listMessages: () => {
+        const chat = spChatData();
+        return chat ? chat.messages.map((m) => ({ isBot: !m || m.isBot })) : [];
+      },
+      currentIndex: spCurrentIndex,
+      jumpTo: spJumpTo,
+      messageText: (i) => {
+        const chat = spChatData();
+        const m = chat && chat.messages[i];
+        return m && typeof m.text === "string" ? m.text : null;
+      },
+      chatData: spChatData,
+      canEdit(m) {
+        const props = spListProps();
+        return !!props && typeof props.onUpdateMessage === "function" && !props.readOnly && !props.isGenerating && !!m.raw.id;
+      },
+      editMessage: spEditMessage,
+      checkFresh: spCheckFresh,
+    },
+  };
+  const site = ADAPTERS[SITE];
+
+
+  /******************************************************************
    * Settings panel
    *
    * A gear button at the end of the bottom bar (and a "Chat Tweaks
@@ -987,32 +1281,40 @@
   const SETTINGS_OVERLAY_ID = "jct-settings-overlay";
 
   const FIELDS = [
-    { section: "Chat bubbles" },
-    { key: "bubbles", label: "Bubble style", type: "select", options: [
+    { section: "Chat bubbles", styling: true },
+    { styling: true, key: "bubbles", label: "Bubble style", type: "select", options: [
       ["joined", "One per message"],
       ["separated", "One per paragraph"],
       ["none", "None"],
     ] },
-    { key: "alternating", label: "Right-aligned messages", type: "select", options: [
+    { styling: true, key: "alternating", label: "Right-aligned messages", type: "select", options: [
       ["off", "None"],
       ["userRight", "My messages"],
       ["botRight", "Bot messages"],
       ["bothRight", "Both"],
     ] },
-    { key: "chatWidthPct", label: "Chat width (% of window)", hint: "0 keeps the site's own width.", type: "number", min: 0, max: 100 },
-    { key: "userBubble", label: "My bubble color", type: "color" },
-    { key: "darkenBotFromUser", label: "Make the bot bubble a darker shade of mine", type: "checkbox" },
-    { key: "botBubble", label: "Bot bubble color", type: "color", disabledIf: (v) => v.darkenBotFromUser },
-    { key: "botDarkenPct", label: "How much darker (%)", type: "number", min: 0, max: 100, disabledIf: (v) => !v.darkenBotFromUser },
-    { section: "Header" },
-    { key: "hideMusicPlayer", label: "Remove the music player", hint: "Turning this back off needs a page reload to bring the player back.", type: "checkbox" },
-    { key: "autoHideHeader", label: "Hide the header until I hover the top edge", type: "checkbox" },
-    { key: "alwaysShowProxyIcon", label: "Keep the proxy badge visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
-    { key: "alwaysShowMenuIcon", label: "Keep the ☰ menu button visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
+    { styling: true, key: "chatWidthPct", label: "Chat width (% of window)", hint: "0 keeps the site's own width.", type: "number", min: 0, max: 100 },
+    { styling: true, key: "userBubble", label: "My bubble color", type: "color" },
+    { styling: true, key: "darkenBotFromUser", label: "Make the bot bubble a darker shade of mine", type: "checkbox" },
+    { styling: true, key: "botBubble", label: "Bot bubble color", type: "color", disabledIf: (v) => v.darkenBotFromUser },
+    { styling: true, key: "botDarkenPct", label: "How much darker (%)", type: "number", min: 0, max: 100, disabledIf: (v) => !v.darkenBotFromUser },
+    { section: "Header", styling: true },
+    { styling: true, key: "hideMusicPlayer", label: "Remove the music player", hint: "Turning this back off needs a page reload to bring the player back.", type: "checkbox" },
+    { styling: true, key: "autoHideHeader", label: "Hide the header until I hover the top edge", type: "checkbox" },
+    { styling: true, key: "alwaysShowProxyIcon", label: "Keep the proxy badge visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
+    { styling: true, key: "alwaysShowMenuIcon", label: "Keep the ☰ menu button visible", type: "checkbox", disabledIf: (v) => !v.autoHideHeader },
     { section: "Story notes stripper (eraser button)" },
     { key: "trackerRegex", label: "Tracker pattern (regular expression)", hint: "Used with the g, i and m flags.", type: "text", mono: true },
     { key: "keepTrackerCount", label: "Newest bot replies that keep their tracker", type: "number", min: 0, max: 999 },
-  ];
+  ].filter((f) => site.styling || !f.styling);
+  // Saucepan carries its GM notebook forward from the newest tracker, so at
+  // least one has to stay.
+  for (const f of FIELDS) {
+    if (f.key === "keepTrackerCount" && site.minKeep > 0) {
+      f.min = site.minKeep;
+      f.hint = `At least ${site.minKeep}, so the newest notes (and the notebook they carry forward) stay.`;
+    }
+  }
 
   function hexToRgb(hex) {
     const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
@@ -1160,7 +1462,7 @@
     overlay.innerHTML = `
       <div class="jct-set-panel" role="dialog" aria-modal="true" aria-labelledby="jct-set-title">
         <div class="jct-set-head">
-          <h2 id="jct-set-title">Chat Tweaks settings</h2>
+          <h2 id="jct-set-title">Chat Tweaks settings · ${site.label}</h2>
           <button type="button" class="jct-set-x" aria-label="Close">×</button>
         </div>
         <div class="jct-set-body"></div>
@@ -1221,7 +1523,7 @@
   }
 
   function ensureSettingsButton() {
-    const left = document.querySelector('[class*="controlsLeft"]');
+    const left = site.controls();
     if (!left) return;
     // Keep it at the end of our buttons, right of Export.
     const prev = left.querySelector(`#${EXPORT_BTN_ID}`);
@@ -1550,6 +1852,14 @@ ${keepIconSel ? `
 ` : ""}
 ` : ""}
 
+/* ===== Small quality-of-life ===== */
+.chat-input-inner { background: none !important; }
+`.trim();
+  return (site.styling ? css + "\n" : "") + UI_CSS + "\n" + SETTINGS_CSS;
+  }
+
+  // Our buttons and flyouts; the same on every site.
+  const UI_CSS = `
 /* ===== Message jump & copy picker ===== */
 #jct-jump-btn,
 #jct-strip-btn,
@@ -1584,7 +1894,7 @@ ${keepIconSel ? `
 }
 #jct-jump-flyout {
   position: fixed;
-  z-index: 1000;
+  z-index: 10000; /* above Saucepan's fixed chat root (3000) */
   display: flex;
   gap: 6px;
   width: min(340px, calc(100vw - 16px));
@@ -1682,7 +1992,7 @@ ${keepIconSel ? `
 #jct-export-flyout,
 #jct-strip-flyout {
   position: fixed;
-  z-index: 1000;
+  z-index: 10000;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -1738,12 +2048,7 @@ ${keepIconSel ? `
   white-space: nowrap;
   color: rgba(255, 255, 255, 0.6);
 }
-
-/* ===== Small quality-of-life ===== */
-.chat-input-inner { background: none !important; }
 `.trim();
-  return css + "\n" + SETTINGS_CSS;
-  }
 
   // One <style> element, rewritten whenever settings are saved.
   let styleEl = null;
