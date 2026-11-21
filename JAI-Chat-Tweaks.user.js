@@ -1849,7 +1849,7 @@ ${keepIconSel ? `
 }
 #jct-jump-flyout {
   position: fixed;
-  z-index: 1000;
+  z-index: 10000; /* above Saucepan's fixed chat root (3000) */
   display: flex;
   gap: 6px;
   width: min(340px, calc(100vw - 16px));
@@ -1947,7 +1947,7 @@ ${keepIconSel ? `
 #jct-export-flyout,
 #jct-strip-flyout {
   position: fixed;
-  z-index: 1000;
+  z-index: 10000;
   display: flex;
   flex-direction: column;
   gap: 8px;
