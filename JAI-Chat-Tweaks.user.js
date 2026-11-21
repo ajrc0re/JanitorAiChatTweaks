@@ -896,12 +896,12 @@
     // copy is out of date and the wrong replies would count as "older".
     if (site.checkFresh) {
       setStripStatus("Checking the chat is up to date…");
-      let fresh = true;
-      try { fresh = await site.checkFresh(targets); } catch (e) { fresh = true; }
-      if (!fresh) {
+      let problem = null;
+      try { problem = await site.checkFresh(targets); } catch (e) { problem = "Couldn't check the chat is up to date."; }
+      if (problem) {
         stripRunning = false;
         if (go) go.disabled = false;
-        setStripStatus("Chat changed elsewhere. Reload the page first.");
+        setStripStatus(problem);
         return;
       }
     }
@@ -1145,26 +1145,29 @@
   // Compare the page's copy with the server's (read-only request, the same
   // one the app makes when it opens a chat, with the app's own token). The
   // newest message and every reply about to be edited must still be there.
-  // If the check itself can't run, the edits go ahead as before.
+  // Returns null when it's safe to edit, else why not. If the check can't
+  // run, nothing is edited.
   async function spCheckFresh(targets) {
+    const CANT = "Couldn't check the chat is up to date. Nothing was changed.";
+    const STALE = "Chat changed elsewhere. Reload the page first.";
     const props = spListProps();
     let token = null;
     try { token = localStorage.getItem("hallucination/auth_token"); } catch (e) { token = null; }
-    if (!props || !props.chatId || !token) return true;
+    if (!props || !props.chatId || !token) return CANT;
     const res = await fetch(`/api/v1/core/chat-state?chat_id=${encodeURIComponent(props.chatId)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
-    if (!res.ok) return true;
+    if (!res.ok) return CANT;
     const data = await res.json();
-    if (!data || !Array.isArray(data.messages)) return true;
+    if (!data || !Array.isArray(data.messages)) return CANT;
     const ids = new Set(data.messages.map((m) => m && m.id));
     const chat = spChatData();
     const last = chat && chat.messages[chat.messages.length - 1];
     const newestServer = data.messages[data.messages.length - 1];
     const known = new Set(props.allGroups.flatMap((g) => (g && g.messages ? g.messages.map((m) => m && m.id) : [])));
-    if (newestServer && !known.has(newestServer.id)) return false;
-    if (last && !ids.has(last.raw.id)) return false;
-    return targets.every((t) => ids.has(t.m.raw.id));
+    if (newestServer && !known.has(newestServer.id)) return STALE;
+    if (last && !ids.has(last.raw.id)) return STALE;
+    return targets.every((t) => ids.has(t.m.raw.id)) ? null : STALE;
   }
 
   // Save through the app's own onUpdateMessage, then confirm the store
@@ -1209,7 +1212,7 @@
    *                    [{ isBot, text, raw } | null] } or null
    *   canEdit(m)       whether message m (from chatData) can be saved
    *   editMessage(m, text)  save new text through the site (async, true/false)
-   *   checkFresh(targets)   optional: false if the chat changed elsewhere (async)
+   *   checkFresh(targets)   optional: null if safe to edit, else a reason (async)
    ******************************************************************/
   const ADAPTERS = {
     janitor: {
