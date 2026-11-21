@@ -70,8 +70,9 @@
     saucepan: {
       // Saucepan's story notes are the final line of a reply: one line of
       // minified JSON in spoiler tags, >!{...}!<, sometimes still wrapped in
-      // <notes> ... </notes>.
-      trackerRegex: String.raw`\s*^[ \t]*(?:<notes>\s*)?>!\s*\{.*\}\s*!<(?:\s*<\/notes>)?[ \t]*$`,
+      // <notes> ... </notes>. Models often slip into ending it with !<> and
+      // dropping a closing brace, so the JSON doesn't have to be valid.
+      trackerRegex: String.raw`\s*^[ \t]*(?:<notes>\s*)?>!\s*\{.*\}\s*!<>?(?:\s*<\/notes>)?[ \t]*$`,
     },
   };
   Object.assign(DEFAULTS, SITE_DEFAULTS[SITE]);
@@ -739,6 +740,7 @@
       </div>
     `;
     const box = fly.querySelector(".jct-export-persona");
+    if (site.hasPersona === false) box.closest("label").hidden = true;
     box.checked = readPref(PERSONA_PREF_KEY, false);
     box.addEventListener("change", () => writePref(PERSONA_PREF_KEY, box.checked));
     fly.querySelector(".jct-export-go").addEventListener("click", doExport);
@@ -1008,6 +1010,149 @@
   window.addEventListener("resize", () => { if (keepHeaderIcons()) scheduleTag(); });
 
   /******************************************************************
+   * Saucepan page access
+   *
+   * Saucepan is a React app whose chat list is react-virtuoso
+   * ([data-testid="virtuoso-scroller"], rows [data-item-index]), so only
+   * about a dozen rows exist in the DOM. Class names come from
+   * styled-components and change between builds, so we rely on aria
+   * labels, data attributes and the list's own props instead. Those props
+   * (found through React's fiber links from a rendered row) hold every
+   * message group (allGroups), the selected variant per response group,
+   * scrollToTopOfMessageByIndex, and onUpdateMessage, which is the app's
+   * own edit save (optimistic update, POST commit-message-edit, rollback
+   * on failure).
+   ******************************************************************/
+  const SP_ROW_SEL = '[data-testid="virtuoso-scroller"] [data-item-index]';
+
+  function spScroller() {
+    return document.querySelector('[data-testid="virtuoso-scroller"]');
+  }
+
+  function spListProps() {
+    for (const row of document.querySelectorAll(SP_ROW_SEL)) {
+      for (const start of [row.firstElementChild, row]) {
+        if (!start) continue;
+        const key = Object.keys(start).find((k) => k.startsWith("__reactFiber"));
+        let f = key && start[key];
+        for (let depth = 0; f && depth < 12; depth++, f = f.return) {
+          const p = f.memoizedProps;
+          if (p && Array.isArray(p.allGroups)) return p;
+        }
+      }
+    }
+    return null;
+  }
+
+  // The variant of a group that's on screen.
+  function spPickMessage(group, selected) {
+    const list = (group && Array.isArray(group.messages) ? group.messages : []).filter(Boolean);
+    if (!list.length) return null;
+    const rg = list[0].responseGroup;
+    const wanted = selected && rg != null ? selected[rg] : null;
+    return (wanted && list.find((m) => m.id === wanted)) || list.find((m) => m.isCanonical) || list[list.length - 1];
+  }
+
+  function spChatData() {
+    const props = spListProps();
+    if (!props) return null;
+    const selected = props.selectedVariantByResponseGroup || {};
+    const messages = props.allGroups.map((g) => {
+      const m = spPickMessage(g, selected);
+      return m ? { isBot: m.role !== "user", text: typeof m.content === "string" ? m.content : null, raw: m } : null;
+    });
+    const bot = messages.find((m) => m && m.isBot && m.raw.author);
+    const user = messages.find((m) => m && !m.isBot && m.raw.author);
+    const charName = String((bot && bot.raw.author) || "Character").trim();
+    const titleBtn = document.querySelector('button[aria-label="Edit chat title"]');
+    const title = ((titleBtn && titleBtn.textContent) || "").trim() || charName;
+    return {
+      title,
+      charName,
+      userName: String((user && user.raw.author) || "You").trim(),
+      personaAbout: null,
+      messages,
+    };
+  }
+
+  // The bottom bar row that holds "Response instructions", "Command" and
+  // "Open editor". Each of those sits in its own span wrapper.
+  function spControls() {
+    const b = document.querySelector('button[aria-label="Open editor"]');
+    if (!b || !b.parentElement) return null;
+    return b.parentElement.tagName === "SPAN" ? b.parentElement.parentElement : b.parentElement;
+  }
+
+  // Smallest box holding both the message textarea and our button.
+  function spInputBox(btn) {
+    const ta = document.querySelector('textarea[placeholder="Write something."]');
+    for (let e = ta; e && e !== document.body; e = e.parentElement) {
+      if (e.contains(btn)) return e;
+    }
+    return null;
+  }
+
+  function spCurrentIndex() {
+    const sc = spScroller();
+    const top = sc ? sc.getBoundingClientRect().top + 8 : 0;
+    let best = -1;
+    for (const el of document.querySelectorAll(SP_ROW_SEL)) {
+      const r = el.getBoundingClientRect();
+      const i = +el.dataset.itemIndex;
+      if (r.bottom > top && (best < 0 || i < best)) best = i;
+    }
+    return best;
+  }
+
+  async function spJumpTo(i) {
+    const props = spListProps();
+    if (!props || typeof props.scrollToTopOfMessageByIndex !== "function") return false;
+    props.scrollToTopOfMessageByIndex(i);
+    let el = null;
+    for (let step = 0; step < 60 && !el; step++) {
+      await frame();
+      el = document.querySelector(`[data-testid="virtuoso-scroller"] [data-item-index="${i}"]`);
+    }
+    if (!el) return false;
+    // Virtuoso re-measures rows as they render, so ask once more.
+    await sleep(60);
+    props.scrollToTopOfMessageByIndex(i);
+    await sleep(60);
+    el = document.querySelector(`[data-testid="virtuoso-scroller"] [data-item-index="${i}"]`) || el;
+    const msg = el.firstElementChild || el;
+    msg.classList.remove("jct-flash");
+    void msg.offsetWidth; // restart the animation
+    msg.classList.add("jct-flash");
+    setTimeout(() => msg.classList.remove("jct-flash"), 1600);
+    return true;
+  }
+
+  // Save through the app's own onUpdateMessage, then confirm the store
+  // holds the new text (it rolls back if the save fails).
+  async function spEditMessage(m, text) {
+    const id = m.raw.id;
+    const current = () => {
+      const chat = spChatData();
+      const hit = chat && chat.messages.find((x) => x && x.raw.id === id);
+      return hit ? hit.text : null;
+    };
+    for (let w = 0; w < 100; w++) {
+      const p = spListProps();
+      if (p && !p.isGenerating) break;
+      await sleep(100);
+    }
+    const props = spListProps();
+    if (!props || typeof props.onUpdateMessage !== "function") return false;
+    await props.onUpdateMessage(Object.assign({}, m.raw, { content: text }));
+    // Give a failed save time to roll back before checking.
+    for (let w = 0; w < 15; w++) {
+      await sleep(100);
+      if (current() !== text) return false;
+    }
+    return current() === text;
+  }
+
+  /******************************************************************
    * Site adapters
    *
    * Everything the shared features need from the page:
@@ -1050,22 +1195,30 @@
       },
     },
 
-    // Saucepan: not wired to the page yet. Until its chat page has been
-    // inspected, controls() finds nothing, so no buttons are added; the
-    // settings panel still opens from the userscript manager's menu.
     saucepan: {
       label: "Saucepan",
       styling: false,
       minKeep: 1,
-      controls: () => null,
-      inputBox: () => null,
-      listMessages: () => [],
-      currentIndex: () => -1,
-      jumpTo: async () => false,
-      messageText: () => null,
-      chatData: () => null,
-      canEdit: () => false,
-      editMessage: async () => false,
+      hasPersona: false,
+      controls: spControls,
+      inputBox: spInputBox,
+      listMessages: () => {
+        const chat = spChatData();
+        return chat ? chat.messages.map((m) => ({ isBot: !m || m.isBot })) : [];
+      },
+      currentIndex: spCurrentIndex,
+      jumpTo: spJumpTo,
+      messageText: (i) => {
+        const chat = spChatData();
+        const m = chat && chat.messages[i];
+        return m && typeof m.text === "string" ? m.text : null;
+      },
+      chatData: spChatData,
+      canEdit(m) {
+        const props = spListProps();
+        return !!props && typeof props.onUpdateMessage === "function" && !props.readOnly && !props.isGenerating && !!m.raw.id;
+      },
+      editMessage: spEditMessage,
     },
   };
   const site = ADAPTERS[SITE];
