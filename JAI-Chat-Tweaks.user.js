@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         Janitor Ai Chat Tweaks
 // @namespace    https://github.com/ajrc0re/JanitorAiChatTweaks
-// @version      1.8.0
+// @version      1.8.1
 // @description  Improves the JanitorAI and Saucepan chat interfaces
 // @match        https://janitorai.com/*
 // @match        https://saucepan.ai/*
 // @match        https://www.saucepan.ai/*
 // @run-at       document-start
+// @sandbox      JavaScript
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -530,6 +531,15 @@
       fly = buildFlyout();
       document.body.appendChild(fly);
     }
+    fillFlyout(fly, btn);
+    if (site.refresh) {
+      site.refresh().then(() => {
+        if (isFlyoutOpen() && !copyMode) fillFlyout(fly, btn);
+      });
+    }
+  }
+
+  function fillFlyout(fly, btn) {
     const msgs = site.listMessages();
     const current = site.currentIndex();
     const grid = fly.querySelector(".jct-jump-grid");
@@ -754,9 +764,13 @@
       fly = buildExportFlyout();
       document.body.appendChild(fly);
     }
-    const chat = site.chatData();
-    const n = chat ? chat.messages.length : 0;
-    setExportStatus(chat ? `${n} message${n === 1 ? "" : "s"}` : "Chat not loaded yet");
+    const showCount = () => {
+      const chat = site.chatData();
+      const n = chat ? chat.messages.length : 0;
+      setExportStatus(chat ? `${n} message${n === 1 ? "" : "s"}` : "Chat not loaded yet");
+    };
+    showCount();
+    if (site.refresh) site.refresh().then(() => { if (isExportOpen()) showCount(); });
     fly.hidden = false;
     btn.setAttribute("aria-expanded", "true");
     positionFlyout(fly, btn);
@@ -918,9 +932,9 @@
     refreshStripFlyout();
     // Stop at the first failure: it usually means the chat changed, and the
     // rest would fail (or hit the wrong replies) too.
-    setStripStatus(failed
+    setStripStatus((failed
       ? `Cleaned ${done}, then a save failed. Stopped; reload and try again.`
-      : `Cleaned ${done} repl${done === 1 ? "y" : "ies"}`);
+      : `Cleaned ${done} repl${done === 1 ? "y" : "ies"}.`) + (done && site.afterEdits ? site.afterEdits() : ""));
   }
 
   function buildStripFlyout() {
@@ -950,6 +964,7 @@
     if (!stripRunning) {
       setStripStatus("");
       refreshStripFlyout();
+      if (site.refresh) site.refresh().then(() => { if (isStripOpen() && !stripRunning) refreshStripFlyout(); });
     }
     fly.hidden = false;
     btn.setAttribute("aria-expanded", "true");
@@ -1037,6 +1052,13 @@
    * scrollToTopOfMessageByIndex, and onUpdateMessage, which is the app's
    * own edit save (optimistic update, POST commit-message-edit, rollback
    * on failure).
+   *
+   * Some userscript managers run the script walled off from the page's
+   * JavaScript (Chrome's isolated world, Safari extensions), where those
+   * fiber links aren't visible. Then we fall back to Saucepan's API with
+   * the app's own token: chat-state to read the chat (the same request the
+   * app makes when it opens one) and commit-message-edit to save. Saved
+   * edits then only show on screen after a reload.
    ******************************************************************/
   const SP_ROW_SEL = '[data-testid="virtuoso-scroller"] [data-item-index]';
 
@@ -1046,8 +1068,10 @@
 
   function spListProps() {
     for (const row of document.querySelectorAll(SP_ROW_SEL)) {
-      for (const start of [row.firstElementChild, row]) {
-        if (!start) continue;
+      for (const node of [row.firstElementChild, row]) {
+        if (!node) continue;
+        // In Firefox's sandbox the page's own properties sit behind wrappedJSObject.
+        const start = node.wrappedJSObject || node;
         const key = Object.keys(start).find((k) => k.startsWith("__reactFiber"));
         let f = key && start[key];
         for (let depth = 0; f && depth < 12; depth++, f = f.return) {
@@ -1059,6 +1083,69 @@
     return null;
   }
 
+  function spToken() {
+    try { return localStorage.getItem("hallucination/auth_token"); } catch (e) { return null; }
+  }
+
+  function spChatId() {
+    const m = /\/chat\/([^/?#]+)/.exec(location.pathname);
+    return m ? decodeURIComponent(m[1]) : null;
+  }
+
+  async function spApi(path, opts) {
+    const token = spToken();
+    if (!token) throw new Error("not signed in");
+    const res = await fetch(location.origin + path, Object.assign({}, opts, {
+      headers: Object.assign({ Authorization: `Bearer ${token}` }, opts && opts.body ? { "Content-Type": "application/json" } : {}),
+    }));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // Last chat-state read for the open chat, used when the page's own list
+  // can't be reached.
+  let spCache = null; // { chatId, messages }
+
+  async function spFetchState(chatId) {
+    const data = await spApi(`/api/v1/core/chat-state?chat_id=${encodeURIComponent(chatId)}`);
+    if (!data || !Array.isArray(data.messages)) throw new Error("unexpected chat-state");
+    return data;
+  }
+
+  // Refresh the cache when the page's list isn't reachable. Called before
+  // a flyout fills itself in.
+  async function spRefresh() {
+    if (spListProps()) return;
+    const chatId = spChatId();
+    if (!chatId) return;
+    try {
+      const data = await spFetchState(chatId);
+      spCache = { chatId, messages: data.messages.filter(Boolean) };
+    } catch (e) {
+      if (!spCache || spCache.chatId !== chatId) spCache = null;
+    }
+  }
+
+  // chat-state lists every message, variants included. Rebuild the groups
+  // the page shows: replies sharing a responseGroup are one group.
+  function spGroupsFromMessages(list) {
+    const groups = [];
+    const byGroup = new Map();
+    for (const m of list) {
+      // Only replies have variants; key by role too so a user message never
+      // merges into a reply that happens to share its group id.
+      const rg = m.responseGroup != null && m.role !== "user" ? m.responseGroup : null;
+      if (rg != null && byGroup.has(rg)) {
+        byGroup.get(rg).messages.push(m);
+        continue;
+      }
+      const g = { messages: [m] };
+      if (rg != null) byGroup.set(rg, g);
+      groups.push(g);
+    }
+    return groups;
+  }
+
   // The variant of a group that's on screen.
   function spPickMessage(group, selected) {
     const list = (group && Array.isArray(group.messages) ? group.messages : []).filter(Boolean);
@@ -1068,11 +1155,26 @@
     return (wanted && list.find((m) => m.id === wanted)) || list.find((m) => m.isCanonical) || list[list.length - 1];
   }
 
+  // Every message id the page (or the cached chat-state) knows about.
+  function spKnownIds() {
+    const props = spListProps();
+    if (props) return new Set(props.allGroups.flatMap((g) => (g && g.messages ? g.messages.map((m) => m && m.id) : [])));
+    return new Set(spCache && spCache.chatId === spChatId() ? spCache.messages.map((m) => m.id) : []);
+  }
+
   function spChatData() {
     const props = spListProps();
-    if (!props) return null;
-    const selected = props.selectedVariantByResponseGroup || {};
-    const messages = props.allGroups.map((g) => {
+    let groups;
+    let selected = {};
+    if (props) {
+      groups = props.allGroups;
+      selected = props.selectedVariantByResponseGroup || {};
+    } else if (spCache && spCache.chatId === spChatId()) {
+      groups = spGroupsFromMessages(spCache.messages);
+    } else {
+      return null;
+    }
+    const messages = groups.map((g) => {
       const m = spPickMessage(g, selected);
       return m ? { isBot: m.role !== "user", text: typeof m.content === "string" ? m.content : null, raw: m } : null;
     });
@@ -1120,20 +1222,46 @@
   }
 
   async function spJumpTo(i) {
+    const rowSel = `[data-testid="virtuoso-scroller"] [data-item-index="${i}"]`;
     const props = spListProps();
-    if (!props || typeof props.scrollToTopOfMessageByIndex !== "function") return false;
-    props.scrollToTopOfMessageByIndex(i);
     let el = null;
-    for (let step = 0; step < 60 && !el; step++) {
-      await frame();
-      el = document.querySelector(`[data-testid="virtuoso-scroller"] [data-item-index="${i}"]`);
+    if (props && typeof props.scrollToTopOfMessageByIndex === "function") {
+      props.scrollToTopOfMessageByIndex(i);
+      for (let step = 0; step < 60 && !el; step++) {
+        await frame();
+        el = document.querySelector(rowSel);
+      }
+      if (!el) return false;
+      // Virtuoso re-measures rows as they render, so ask once more.
+      await sleep(60);
+      props.scrollToTopOfMessageByIndex(i);
+      await sleep(60);
+    } else {
+      // No access to the list's own scroll: step through it until the row
+      // renders, then line its top up with the top of the scroller.
+      const sc = spScroller();
+      if (!sc) return false;
+      for (let step = 0; step < 300 && !el; step++) {
+        el = document.querySelector(rowSel);
+        if (el) break;
+        const idx = [...document.querySelectorAll(SP_ROW_SEL)].map((r) => +r.dataset.itemIndex);
+        if (!idx.length) return false;
+        const before = sc.scrollTop;
+        sc.scrollTop += (i < Math.min(...idx) ? -1 : 1) * sc.clientHeight * 0.8;
+        if (sc.scrollTop === before) break;
+        await sleep(40);
+      }
+      if (!el) return false;
+      for (let pass = 0; pass < 3; pass++) {
+        await frame();
+        el = document.querySelector(rowSel) || el;
+        const delta = el.getBoundingClientRect().top - sc.getBoundingClientRect().top;
+        if (Math.abs(delta) < 2) break;
+        sc.scrollTop += delta;
+        await sleep(40);
+      }
     }
-    if (!el) return false;
-    // Virtuoso re-measures rows as they render, so ask once more.
-    await sleep(60);
-    props.scrollToTopOfMessageByIndex(i);
-    await sleep(60);
-    el = document.querySelector(`[data-testid="virtuoso-scroller"] [data-item-index="${i}"]`) || el;
+    el = document.querySelector(rowSel) || el;
     const msg = el.firstElementChild || el;
     msg.classList.remove("jct-flash");
     void msg.offsetWidth; // restart the animation
@@ -1151,28 +1279,46 @@
     const CANT = "Couldn't check the chat is up to date. Nothing was changed.";
     const STALE = "Chat changed elsewhere. Reload the page first.";
     const props = spListProps();
-    let token = null;
-    try { token = localStorage.getItem("hallucination/auth_token"); } catch (e) { token = null; }
-    if (!props || !props.chatId || !token) return CANT;
-    const res = await fetch(`/api/v1/core/chat-state?chat_id=${encodeURIComponent(props.chatId)}`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!res.ok) return CANT;
-    const data = await res.json();
-    if (!data || !Array.isArray(data.messages)) return CANT;
+    const chatId = (props && props.chatId) || spChatId();
+    if (!chatId || !spToken()) return CANT;
+    let data;
+    try { data = await spFetchState(chatId); } catch (e) { return CANT; }
     const ids = new Set(data.messages.map((m) => m && m.id));
     const chat = spChatData();
     const last = chat && chat.messages[chat.messages.length - 1];
     const newestServer = data.messages[data.messages.length - 1];
-    const known = new Set(props.allGroups.flatMap((g) => (g && g.messages ? g.messages.map((m) => m && m.id) : [])));
+    const known = spKnownIds();
     if (newestServer && !known.has(newestServer.id)) return STALE;
     if (last && !ids.has(last.raw.id)) return STALE;
     return targets.every((t) => ids.has(t.m.raw.id)) ? null : STALE;
   }
 
+  // Without the page's list: save straight to the API. The page keeps
+  // showing the old text until it's reloaded.
+  async function spEditViaApi(m, text) {
+    const chatId = spChatId();
+    if (!chatId) return false;
+    try {
+      await spApi("/api/v2/chat/commit-message-edit", {
+        method: "POST",
+        body: JSON.stringify({ chat_id: chatId, message_id: m.raw.id, content: text }),
+      });
+    } catch (e) {
+      return false;
+    }
+    if (spCache) {
+      const hit = spCache.messages.find((x) => x.id === m.raw.id);
+      if (hit) hit.content = text;
+    }
+    spNeedsReload = true;
+    return true;
+  }
+  let spNeedsReload = false;
+
   // Save through the app's own onUpdateMessage, then confirm the store
   // holds the new text (it rolls back if the save fails).
   async function spEditMessage(m, text) {
+    if (!spListProps()) return spEditViaApi(m, text);
     const id = m.raw.id;
     const current = () => {
       const chat = spChatData();
@@ -1213,6 +1359,8 @@
    *   canEdit(m)       whether message m (from chatData) can be saved
    *   editMessage(m, text)  save new text through the site (async, true/false)
    *   checkFresh(targets)   optional: null if safe to edit, else a reason (async)
+   *   refresh()        optional: reload chat data before a flyout fills in (async)
+   *   afterEdits()     optional: text added to the eraser's result line
    ******************************************************************/
   const ADAPTERS = {
     janitor: {
@@ -1259,11 +1407,15 @@
       },
       chatData: spChatData,
       canEdit(m) {
+        if (!m.raw.id) return false;
         const props = spListProps();
-        return !!props && typeof props.onUpdateMessage === "function" && !props.readOnly && !props.isGenerating && !!m.raw.id;
+        if (!props) return !!spToken();
+        return typeof props.onUpdateMessage === "function" && !props.readOnly && !props.isGenerating;
       },
       editMessage: spEditMessage,
       checkFresh: spCheckFresh,
+      refresh: spRefresh,
+      afterEdits: () => (spNeedsReload ? " Reload the page to see the changes." : ""),
     },
   };
   const site = ADAPTERS[SITE];
@@ -2048,6 +2200,7 @@ ${keepIconSel ? `
   white-space: nowrap;
   color: rgba(255, 255, 255, 0.6);
 }
+#jct-strip-flyout .jct-strip-status { white-space: normal; }
 `.trim();
 
   // One <style> element, rewritten whenever settings are saved.
